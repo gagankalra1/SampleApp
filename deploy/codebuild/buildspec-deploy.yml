@@ -1,0 +1,59 @@
+version: 0.2
+
+# Builds the VoltMart images and deploys the application.
+#
+# The buildspec is deliberately thin: all the logic lives in deploy.sh, which
+# can be read as a document and run by hand against an existing cluster. A
+# 200-line shell script embedded in YAML is nobody's idea of maintainable.
+
+env:
+  variables:
+    DOCKER_BUILDKIT: "1"
+    # Quieter pip and npm output, so the build log stays readable enough to
+    # find a real error in.
+    PIP_DISABLE_PIP_VERSION_CHECK: "1"
+    PYTHONUNBUFFERED: "1"
+
+phases:
+  install:
+    runtime-versions:
+      python: 3.12
+    commands:
+      - echo "VoltMart deploy build ${CODEBUILD_BUILD_ID}"
+      - chmod +x deploy/codebuild/*.sh
+
+  pre_build:
+    commands:
+      # Fail loudly and immediately if the environment is incomplete, rather
+      # than halfway through an image build.
+      - |
+        for required in CLUSTER_NAME AWS_REGION_NAME REGISTRY_URI NAME_PREFIX VPC_ID; do
+          if [ -z "$(eval echo \$${required})" ]; then
+            echo "ERROR: ${required} is not set" >&2
+            exit 1
+          fi
+        done
+      - aws --version
+      - docker --version
+
+  build:
+    commands:
+      # deploy.sh installs its own tools, applies everything, and signals the
+      # stack's WaitCondition on every exit path.
+      - ./deploy/codebuild/deploy.sh
+
+  post_build:
+    commands:
+      - echo "build phase finished with status ${CODEBUILD_BUILD_SUCCEEDING}"
+      # deploy.sh has an EXIT trap that signals CloudFormation, so a normal
+      # failure is already reported. This covers the case where the script is
+      # killed before its trap runs — an OOM, or the CodeBuild timeout — in
+      # which case nothing else would ever signal and the stack would hang
+      # until its own ceiling.
+      - |
+        if [ "${CODEBUILD_BUILD_SUCCEEDING}" != "1" ] && [ -n "${WAIT_CONDITION_URL}" ]; then
+          echo "build did not succeed; sending a backstop FAILURE signal"
+          curl --silent --show-error --max-time 30 -X PUT -H 'Content-Type:' \
+            --data-binary "{\"Status\":\"FAILURE\",\"Reason\":\"Deploy build failed. See CodeBuild log ${CODEBUILD_BUILD_ID}\",\"UniqueId\":\"voltmart-deploy\",\"Data\":\"failed\"}" \
+            "${WAIT_CONDITION_URL}" || true
+        fi

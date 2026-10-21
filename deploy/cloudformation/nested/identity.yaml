@@ -1,0 +1,413 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  Per-service IAM roles, bound to Kubernetes service accounts with EKS Pod
+  Identity associations.
+
+# The whole point of this template
+# --------------------------------
+# One role per service, each granting the least that service actually needs,
+# and each bound to exactly one Kubernetes ServiceAccount.
+#
+# The alternative — attaching application permissions to the node role — is
+# shorter and much worse: every pod on the node inherits every permission, so
+# a bug in the catalog service grants an attacker the ability to write orders
+# and invoke Bedrock. Here the catalog service has no AWS role at all, and the
+# payment service cannot read the orders table.
+#
+# Pod Identity rather than IRSA: no OIDC provider to register, no trust policy
+# with a hand-built `sub` condition to get subtly wrong, and the association
+# is a plain CloudFormation resource. Credentials are short-lived and
+# delivered by the pod identity agent; there is no access key anywhere in this
+# stack.
+#
+# Writing the matrix out:
+#
+#   service         DynamoDB                      other
+#   -------------   ---------------------------   --------------------------
+#   catalog         (none)                        (none)
+#   inventory       inventory  rw                 -
+#   cart            carts      rw                 -
+#   orders          orders     rw                 -
+#   payment         payments   rw                 -
+#   checkout        (none - calls services)       -
+#   support-agent   conversations rw              bedrock:InvokeModel
+#   collector       (none)                        X-Ray, CloudWatch, APS write
+
+Parameters:
+  ClusterName:
+    Type: String
+
+  NamePrefix:
+    Type: String
+
+  InventoryTableArn:
+    Type: String
+  CartsTableArn:
+    Type: String
+  OrdersTableArn:
+    Type: String
+  PaymentsTableArn:
+    Type: String
+  ConversationsTableArn:
+    Type: String
+
+  PrometheusWorkspaceArn:
+    Type: String
+
+  BedrockModelId:
+    Type: String
+    Description: >-
+      The model the agent may invoke. Used to scope the IAM policy, so the
+      agent cannot call a model nobody budgeted for.
+
+Resources:
+  # =========================================================================
+  # A reusable trust policy
+  # =========================================================================
+  # Every pod role trusts only the EKS pod identity service, which can assume
+  # it solely on behalf of the specific service account named in the
+  # association below. sts:TagSession is required by the Pod Identity flow.
+
+  # ---- inventory ---------------------------------------------------------
+  InventoryRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${NamePrefix}-inventory'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: pods.eks.amazonaws.com }
+            Action: [sts:AssumeRole, sts:TagSession]
+      Policies:
+        - PolicyName: inventory-table-access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:DeleteItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                  - dynamodb:DescribeTable
+                # Scoped to this one table. No wildcard, no other service's
+                # data, not even read access.
+                Resource: !Ref InventoryTableArn
+      Tags:
+        - { Key: Project, Value: voltmart }
+
+  InventoryPodIdentity:
+    Type: AWS::EKS::PodIdentityAssociation
+    Properties:
+      ClusterName: !Ref ClusterName
+      Namespace: voltmart
+      ServiceAccount: voltmart-inventory
+      RoleArn: !GetAtt InventoryRole.Arn
+
+  # ---- cart --------------------------------------------------------------
+  CartRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${NamePrefix}-cart'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: pods.eks.amazonaws.com }
+            Action: [sts:AssumeRole, sts:TagSession]
+      Policies:
+        - PolicyName: carts-table-access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:DeleteItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                  - dynamodb:DescribeTable
+                Resource:
+                  - !Ref CartsTableArn
+                  # The customer-index GSI needs to be named separately; a
+                  # table ARN alone does not cover its indexes.
+                  - !Sub '${CartsTableArn}/index/*'
+      Tags:
+        - { Key: Project, Value: voltmart }
+
+  CartPodIdentity:
+    Type: AWS::EKS::PodIdentityAssociation
+    Properties:
+      ClusterName: !Ref ClusterName
+      Namespace: voltmart
+      ServiceAccount: voltmart-cart
+      RoleArn: !GetAtt CartRole.Arn
+
+  # ---- orders ------------------------------------------------------------
+  OrdersRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${NamePrefix}-orders'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: pods.eks.amazonaws.com }
+            Action: [sts:AssumeRole, sts:TagSession]
+      Policies:
+        - PolicyName: orders-table-access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                  - dynamodb:DescribeTable
+                # No dynamodb:DeleteItem. Orders are the permanent record;
+                # the application cancels them by status transition and never
+                # deletes a row, so the role should not be able to either.
+                Resource:
+                  - !Ref OrdersTableArn
+                  - !Sub '${OrdersTableArn}/index/*'
+      Tags:
+        - { Key: Project, Value: voltmart }
+
+  OrdersPodIdentity:
+    Type: AWS::EKS::PodIdentityAssociation
+    Properties:
+      ClusterName: !Ref ClusterName
+      Namespace: voltmart
+      ServiceAccount: voltmart-orders
+      RoleArn: !GetAtt OrdersRole.Arn
+
+  # ---- payment -----------------------------------------------------------
+  PaymentRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${NamePrefix}-payment'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: pods.eks.amazonaws.com }
+            Action: [sts:AssumeRole, sts:TagSession]
+      Policies:
+        - PolicyName: payments-table-access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:Query
+                  - dynamodb:DescribeTable
+                # No Scan and no DeleteItem: payment records are read by id or
+                # by order, never enumerated, and never removed.
+                Resource:
+                  - !Ref PaymentsTableArn
+                  - !Sub '${PaymentsTableArn}/index/*'
+      Tags:
+        - { Key: Project, Value: voltmart }
+
+  PaymentPodIdentity:
+    Type: AWS::EKS::PodIdentityAssociation
+    Properties:
+      ClusterName: !Ref ClusterName
+      Namespace: voltmart
+      ServiceAccount: voltmart-payment
+      RoleArn: !GetAtt PaymentRole.Arn
+
+  # ---- support agent -----------------------------------------------------
+  SupportAgentRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${NamePrefix}-support-agent'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: pods.eks.amazonaws.com }
+            Action: [sts:AssumeRole, sts:TagSession]
+      Policies:
+        - PolicyName: conversations-table-access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:DeleteItem
+                  - dynamodb:DescribeTable
+                Resource: !Ref ConversationsTableArn
+        - PolicyName: bedrock-invoke
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - bedrock:InvokeModel
+                  - bedrock:InvokeModelWithResponseStream
+                Resource:
+                  # Cross-region inference profiles route the call to a
+                  # regional foundation model, so both the profile ARN and the
+                  # underlying model ARNs have to be allowed. The wildcards
+                  # are over region, not over model: the model id is pinned to
+                  # whatever the stack was deployed with, so the agent cannot
+                  # silently start invoking a more expensive model.
+                  - !Sub 'arn:${AWS::Partition}:bedrock:*::foundation-model/*'
+                  - !Sub 'arn:${AWS::Partition}:bedrock:*:${AWS::AccountId}:inference-profile/${BedrockModelId}'
+              # Lets the diagnostics endpoint report which models the account
+              # can actually reach — the single most useful thing to know
+              # when the agent will not start in a fresh workshop account.
+              - Effect: Allow
+                Action:
+                  - bedrock:ListFoundationModels
+                  - bedrock:ListInferenceProfiles
+                Resource: '*'
+      Tags:
+        - { Key: Project, Value: voltmart }
+
+  SupportAgentPodIdentity:
+    Type: AWS::EKS::PodIdentityAssociation
+    Properties:
+      ClusterName: !Ref ClusterName
+      Namespace: voltmart
+      ServiceAccount: voltmart-support-agent
+      RoleArn: !GetAtt SupportAgentRole.Arn
+
+  # ---- collector ---------------------------------------------------------
+  CollectorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${NamePrefix}-collector'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: pods.eks.amazonaws.com }
+            Action: [sts:AssumeRole, sts:TagSession]
+      ManagedPolicyArns:
+        # The AWS-managed policy for the ADOT collector: X-Ray segment upload,
+        # CloudWatch metric and log writes, plus the EC2/EKS describes the
+        # resource detection processor needs.
+        - arn:aws:iam::aws:policy/AWSXrayWriteOnlyAccess
+        - arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy
+      Policies:
+        - PolicyName: prometheus-remote-write
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - aps:RemoteWrite
+                  # Write only. The collector never queries metrics back, so
+                  # aps:QueryMetrics is not granted.
+                Resource: !Ref PrometheusWorkspaceArn
+        - PolicyName: cloudwatch-logs-write
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - logs:DescribeLogStreams
+                  - logs:DescribeLogGroups
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/voltmart/*'
+      Tags:
+        - { Key: Project, Value: voltmart }
+
+  CollectorPodIdentity:
+    Type: AWS::EKS::PodIdentityAssociation
+    Properties:
+      ClusterName: !Ref ClusterName
+      Namespace: voltmart
+      ServiceAccount: voltmart-collector
+      RoleArn: !GetAtt CollectorRole.Arn
+
+  # ---- AWS Load Balancer Controller --------------------------------------
+  # Installed by the deployer with Helm. It needs to create and configure
+  # load balancers on the account's behalf, which is unavoidably broad; the
+  # policy below is scoped as tightly as the controller permits.
+  LoadBalancerControllerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${NamePrefix}-lb-controller'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: pods.eks.amazonaws.com }
+            Action: [sts:AssumeRole, sts:TagSession]
+      Policies:
+        - PolicyName: elb-management
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - elasticloadbalancing:*
+                  - ec2:CreateSecurityGroup
+                  - ec2:CreateTags
+                  - ec2:DeleteTags
+                  - ec2:DeleteSecurityGroup
+                  - ec2:AuthorizeSecurityGroupIngress
+                  - ec2:RevokeSecurityGroupIngress
+                  - ec2:Describe*
+                  - ec2:GetSecurityGroupsForVpc
+                  - acm:ListCertificates
+                  - acm:DescribeCertificate
+                  - iam:ListServerCertificates
+                  - iam:GetServerCertificate
+                  - cognito-idp:DescribeUserPoolClient
+                  - waf-regional:*
+                  - wafv2:*
+                  - shield:Describe*
+                  - shield:Get*
+                Resource: '*'
+              - Effect: Allow
+                Action: iam:CreateServiceLinkedRole
+                Resource: '*'
+                Condition:
+                  StringEquals:
+                    iam:AWSServiceName: elasticloadbalancing.amazonaws.com
+      Tags:
+        - { Key: Project, Value: voltmart }
+
+  LoadBalancerControllerPodIdentity:
+    Type: AWS::EKS::PodIdentityAssociation
+    Properties:
+      ClusterName: !Ref ClusterName
+      Namespace: kube-system
+      ServiceAccount: aws-load-balancer-controller
+      RoleArn: !GetAtt LoadBalancerControllerRole.Arn
+
+Outputs:
+  InventoryRoleArn:
+    Value: !GetAtt InventoryRole.Arn
+  CartRoleArn:
+    Value: !GetAtt CartRole.Arn
+  OrdersRoleArn:
+    Value: !GetAtt OrdersRole.Arn
+  PaymentRoleArn:
+    Value: !GetAtt PaymentRole.Arn
+  SupportAgentRoleArn:
+    Value: !GetAtt SupportAgentRole.Arn
+  CollectorRoleArn:
+    Value: !GetAtt CollectorRole.Arn
+  LoadBalancerControllerRoleArn:
+    Value: !GetAtt LoadBalancerControllerRole.Arn

@@ -1,0 +1,135 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  IAM role for the VoltMart deployer build. Separated from the deployer stack
+  to break a dependency cycle.
+
+# Why this is its own stack
+# -------------------------
+# The EKS cluster needs this role's ARN at creation time, because the access
+# entry that grants the deployer permission to run kubectl is part of the
+# cluster resource. But the deployer stack must be created *after* the cluster,
+# since its build applies manifests to a cluster that has to already exist.
+#
+# Cluster needs role -> deployer needs cluster -> deployer owns role: a cycle.
+# Lifting the role into a stack of its own resolves it:
+#
+#   deployer-role  ->  cluster  ->  identity  ->  deployer
+#
+# This role is powerful by design: it builds and pushes images and holds
+# cluster-admin on the cluster. Three things keep that acceptable:
+#   * only CodeBuild in this account can assume it
+#   * it is scoped to this stack's ECR repositories and log groups by name
+#   * it is deleted with the stack
+#
+# Application pods never use it. They get their own narrowly-scoped roles via
+# Pod Identity (see identity.yaml).
+
+Parameters:
+  NamePrefix:
+    Type: String
+
+  AssetsBucket:
+    Type: String
+
+  AssetsPrefix:
+    Type: String
+
+Resources:
+  DeployerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${NamePrefix}-deployer'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: codebuild.amazonaws.com }
+            Action: sts:AssumeRole
+            Condition:
+              # Belt and braces: even within this account, only a CodeBuild
+              # project belonging to this stack may assume the role.
+              StringEquals:
+                aws:SourceAccount: !Ref 'AWS::AccountId'
+      Policies:
+        - PolicyName: deployer
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: Logs
+                Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/voltmart/*'
+                  - !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/*'
+
+              - Sid: PullSourceArchive
+                Effect: Allow
+                Action: [s3:GetObject, s3:GetObjectVersion]
+                Resource: !Sub 'arn:${AWS::Partition}:s3:::${AssetsBucket}/${AssetsPrefix}/*'
+
+              # GetAuthorizationToken cannot be resource-scoped; it returns a
+              # registry-wide token. The push actions below are what actually
+              # constrain where images can go.
+              - Sid: EcrAuth
+                Effect: Allow
+                Action: ecr:GetAuthorizationToken
+                Resource: '*'
+
+              - Sid: EcrPush
+                Effect: Allow
+                Action:
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:CompleteLayerUpload
+                  - ecr:InitiateLayerUpload
+                  - ecr:PutImage
+                  - ecr:UploadLayerPart
+                  - ecr:BatchGetImage
+                  - ecr:GetDownloadUrlForLayer
+                  - ecr:DescribeRepositories
+                  - ecr:DescribeImages
+                Resource: !Sub 'arn:${AWS::Partition}:ecr:${AWS::Region}:${AWS::AccountId}:repository/${NamePrefix}/*'
+
+              - Sid: DescribeCluster
+                Effect: Allow
+                Action:
+                  - eks:DescribeCluster
+                  - eks:ListClusters
+                  - eks:DescribeAddon
+                  - eks:DescribeNodegroup
+                  - eks:ListPodIdentityAssociations
+                Resource: '*'
+
+              - Sid: DescribeNetwork
+                Effect: Allow
+                Action:
+                  - ec2:DescribeSubnets
+                  - ec2:DescribeSecurityGroups
+                  - ec2:DescribeVpcs
+                  - elasticloadbalancing:DescribeLoadBalancers
+                  - elasticloadbalancing:DescribeTags
+                Resource: '*'
+
+              - Sid: SeedTables
+                Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:GetItem
+                  - dynamodb:DescribeTable
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${NamePrefix}-*'
+
+              - Sid: ReadStackOutputs
+                Effect: Allow
+                Action: cloudformation:DescribeStacks
+                Resource: !Sub 'arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${NamePrefix}*/*'
+      Tags:
+        - { Key: Project, Value: voltmart }
+
+Outputs:
+  DeployerRoleArn:
+    Value: !GetAtt DeployerRole.Arn
+  DeployerRoleName:
+    Value: !Ref DeployerRole

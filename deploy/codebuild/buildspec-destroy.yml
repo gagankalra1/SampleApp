@@ -1,0 +1,22 @@
+version: 0.2
+
+# Teardown, selected by the trigger Lambda via buildspecOverride when the
+# CloudFormation stack is deleted.
+#
+# Removes the Ingress and waits for the Kubernetes-created load balancer to
+# actually disappear, so that CloudFormation can delete the VPC afterwards
+# instead of failing on the ALB's leftover network interfaces.
+#
+# No image builds here, so this finishes in a few minutes rather than twenty.
+
+phases:
+  install:
+    commands:
+      - echo "VoltMart teardown build ${CODEBUILD_BUILD_ID}"
+      - chmod +x deploy/codebuild/*.sh
+
+  build:
+    commands:
+      # Always exits zero. A teardown that cannot finish must not stop the
+      # stack delete; destroy.sh logs anything it had to leave behind.
+      - ./deploy/codebuild/destroy.sh

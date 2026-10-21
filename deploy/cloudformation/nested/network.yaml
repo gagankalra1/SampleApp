@@ -1,0 +1,256 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  VoltMart network. A VPC across two Availability Zones with public subnets for
+  the load balancer and private subnets for the worker nodes.
+
+# Why the nodes sit in private subnets
+# ------------------------------------
+# Worker nodes have no public IP and no inbound route from the internet. They
+# reach AWS APIs and Amazon ECR outbound through NAT. The only thing with a
+# public address is the Application Load Balancer, so the attack surface is
+# one load balancer rather than every node.
+#
+# Cost note: NAT gateways are the largest fixed cost in this stack (roughly
+# $32/month each plus data processing). SingleNatGateway halves that at the
+# price of an AZ-level single point of failure, which is the right trade for a
+# one-day workshop and the wrong one for anything durable.
+
+Parameters:
+  VpcCidr:
+    Type: String
+    Default: 10.0.0.0/16
+    AllowedPattern: '^(\d{1,3}\.){3}\d{1,3}/\d{1,2}$'
+    Description: CIDR block for the VPC. Must not overlap any network you intend to peer with.
+
+  SingleNatGateway:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: >-
+      Use one NAT gateway for both AZs (cheaper) or one per AZ (resilient).
+      Choose false for anything that needs to survive an AZ failure.
+
+  ClusterName:
+    Type: String
+    Description: EKS cluster name, used for the subnet tags the load balancer controller needs.
+
+Conditions:
+  CreateSecondNatGateway: !Equals [!Ref SingleNatGateway, 'false']
+
+Resources:
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      # Both required for EKS: pods resolve service endpoints by DNS name.
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - { Key: Name, Value: !Sub '${AWS::StackName}-vpc' }
+        - { Key: Project, Value: voltmart }
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - { Key: Name, Value: !Sub '${AWS::StackName}-igw' }
+
+  AttachGateway:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref Vpc
+      InternetGatewayId: !Ref InternetGateway
+
+  # ---- Public subnets (load balancer) ------------------------------------
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: !Select [0, !GetAZs '']
+      CidrBlock: !Select [0, !Cidr [!Ref VpcCidr, 6, 8]]
+      MapPublicIpOnLaunch: true
+      Tags:
+        - { Key: Name, Value: !Sub '${AWS::StackName}-public-1' }
+        # The AWS Load Balancer Controller discovers where to put an
+        # internet-facing ALB by looking for this tag. Without it, an Ingress
+        # stays pending with no obvious explanation.
+        - { Key: kubernetes.io/role/elb, Value: '1' }
+        - { Key: !Sub 'kubernetes.io/cluster/${ClusterName}', Value: shared }
+
+  PublicSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: !Select [1, !GetAZs '']
+      CidrBlock: !Select [1, !Cidr [!Ref VpcCidr, 6, 8]]
+      MapPublicIpOnLaunch: true
+      Tags:
+        - { Key: Name, Value: !Sub '${AWS::StackName}-public-2' }
+        - { Key: kubernetes.io/role/elb, Value: '1' }
+        - { Key: !Sub 'kubernetes.io/cluster/${ClusterName}', Value: shared }
+
+  # ---- Private subnets (worker nodes) ------------------------------------
+  PrivateSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: !Select [0, !GetAZs '']
+      CidrBlock: !Select [2, !Cidr [!Ref VpcCidr, 6, 8]]
+      MapPublicIpOnLaunch: false
+      Tags:
+        - { Key: Name, Value: !Sub '${AWS::StackName}-private-1' }
+        - { Key: kubernetes.io/role/internal-elb, Value: '1' }
+        - { Key: !Sub 'kubernetes.io/cluster/${ClusterName}', Value: shared }
+
+  PrivateSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: !Select [1, !GetAZs '']
+      CidrBlock: !Select [3, !Cidr [!Ref VpcCidr, 6, 8]]
+      MapPublicIpOnLaunch: false
+      Tags:
+        - { Key: Name, Value: !Sub '${AWS::StackName}-private-2' }
+        - { Key: kubernetes.io/role/internal-elb, Value: '1' }
+        - { Key: !Sub 'kubernetes.io/cluster/${ClusterName}', Value: shared }
+
+  # ---- NAT ---------------------------------------------------------------
+  NatEip1:
+    Type: AWS::EC2::EIP
+    DependsOn: AttachGateway
+    Properties:
+      Domain: vpc
+      Tags:
+        - { Key: Name, Value: !Sub '${AWS::StackName}-nat-eip-1' }
+
+  NatGateway1:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NatEip1.AllocationId
+      SubnetId: !Ref PublicSubnet1
+      Tags:
+        - { Key: Name, Value: !Sub '${AWS::StackName}-nat-1' }
+
+  NatEip2:
+    Type: AWS::EC2::EIP
+    Condition: CreateSecondNatGateway
+    DependsOn: AttachGateway
+    Properties:
+      Domain: vpc
+
+  NatGateway2:
+    Type: AWS::EC2::NatGateway
+    Condition: CreateSecondNatGateway
+    Properties:
+      AllocationId: !GetAtt NatEip2.AllocationId
+      SubnetId: !Ref PublicSubnet2
+      Tags:
+        - { Key: Name, Value: !Sub '${AWS::StackName}-nat-2' }
+
+  # ---- Routing -----------------------------------------------------------
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags:
+        - { Key: Name, Value: !Sub '${AWS::StackName}-public-rt' }
+
+  PublicDefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: AttachGateway
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnet1RouteAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet1
+      RouteTableId: !Ref PublicRouteTable
+
+  PublicSubnet2RouteAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet2
+      RouteTableId: !Ref PublicRouteTable
+
+  PrivateRouteTable1:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags:
+        - { Key: Name, Value: !Sub '${AWS::StackName}-private-rt-1' }
+
+  PrivateDefaultRoute1:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable1
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGateway1
+
+  PrivateSubnet1RouteAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet1
+      RouteTableId: !Ref PrivateRouteTable1
+
+  PrivateRouteTable2:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags:
+        - { Key: Name, Value: !Sub '${AWS::StackName}-private-rt-2' }
+
+  PrivateDefaultRoute2:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable2
+      DestinationCidrBlock: 0.0.0.0/0
+      # Falls back to the first NAT gateway when running in single-NAT mode.
+      NatGatewayId: !If [CreateSecondNatGateway, !Ref NatGateway2, !Ref NatGateway1]
+
+  PrivateSubnet2RouteAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet2
+      RouteTableId: !Ref PrivateRouteTable2
+
+  # ---- VPC endpoints -----------------------------------------------------
+  # A gateway endpoint for S3 costs nothing and keeps ECR image layer pulls
+  # (which live in S3) off the NAT gateway. On a cluster that pulls eight
+  # images onto every new node, this is the single cheapest optimisation
+  # available.
+  S3GatewayEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref Vpc
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.s3'
+      VpcEndpointType: Gateway
+      RouteTableIds:
+        - !Ref PrivateRouteTable1
+        - !Ref PrivateRouteTable2
+
+  DynamoDbGatewayEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref Vpc
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.dynamodb'
+      VpcEndpointType: Gateway
+      RouteTableIds:
+        - !Ref PrivateRouteTable1
+        - !Ref PrivateRouteTable2
+
+Outputs:
+  VpcId:
+    Value: !Ref Vpc
+  VpcCidr:
+    Value: !Ref VpcCidr
+  PublicSubnetIds:
+    Value: !Join [',', [!Ref PublicSubnet1, !Ref PublicSubnet2]]
+  PrivateSubnetIds:
+    Value: !Join [',', [!Ref PrivateSubnet1, !Ref PrivateSubnet2]]
+  PrivateSubnet1Id:
+    Value: !Ref PrivateSubnet1
+  PrivateSubnet2Id:
+    Value: !Ref PrivateSubnet2

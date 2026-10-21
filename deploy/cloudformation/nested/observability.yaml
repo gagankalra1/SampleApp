@@ -1,0 +1,328 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  VoltMart observability targets: the Prometheus workspace, log groups and a
+  CloudWatch dashboard. The collector in the cluster writes to all of these.
+
+# What lands where, and why there are three destinations rather than one:
+#
+#   X-Ray        request-scoped causality. "This checkout failed — which of
+#                the five service calls broke, and what did it say?"
+#   Prometheus   time series for rates and percentiles. "Is the p99 checkout
+#                latency drifting?" Queryable with PromQL and Grafana.
+#   CloudWatch   logs, alarms and a dashboard. The place an operator looks
+#                first, and the only one of the three that can page someone.
+#
+# The application knows about none of them. It emits OTLP to the collector,
+# and the collector fans out. Replacing any of these is a collector config
+# change.
+
+Parameters:
+  NamePrefix:
+    Type: String
+    Description: Prefix for resource names, normally the stack name.
+
+  LogRetentionDays:
+    Type: Number
+    Default: 7
+    AllowedValues: [1, 3, 5, 7, 14, 30, 60, 90, 180, 365]
+    Description: >-
+      Log retention. Seven days suits a workshop; the default of "never
+      expire" is how sample accounts quietly accumulate a CloudWatch bill.
+
+  AlarmEmail:
+    Type: String
+    Default: ''
+    Description: >-
+      Optional email for alarm notifications. Leave blank to create the
+      alarms without a subscription — they still show state in the console.
+    AllowedPattern: '^$|^[^@\s]+@[^@\s]+\.[^@\s]+$'
+
+Conditions:
+  HasAlarmEmail: !Not [!Equals [!Ref AlarmEmail, '']]
+
+Resources:
+  # =========================================================================
+  # Amazon Managed Service for Prometheus
+  # =========================================================================
+  PrometheusWorkspace:
+    Type: AWS::APS::Workspace
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      Alias: !Sub '${NamePrefix}-metrics'
+      Tags:
+        - { Key: Project, Value: voltmart }
+
+  # =========================================================================
+  # Log groups
+  # =========================================================================
+  # Created here rather than left to the collector so that retention is set
+  # from the start. A log group created implicitly on first write retains
+  # forever.
+  ApplicationLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      LogGroupName: /aws/voltmart/application
+      RetentionInDays: !Ref LogRetentionDays
+      Tags:
+        - { Key: Project, Value: voltmart }
+
+  MetricsLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      # The awsemf exporter writes metrics as Embedded Metric Format log
+      # events; CloudWatch extracts the metrics from them. The log events
+      # themselves are only useful for debugging the pipeline, so they expire
+      # quickly regardless of the application retention setting.
+      LogGroupName: /aws/voltmart/metrics
+      RetentionInDays: 3
+      Tags:
+        - { Key: Project, Value: voltmart }
+
+  DeployerLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      LogGroupName: !Sub '/aws/voltmart/${NamePrefix}/deployer'
+      # Longer than the rest on purpose: when a workshop deployment fails,
+      # this log is the only record of why, and it needs to outlive the
+      # troubleshooting session.
+      RetentionInDays: 30
+      Tags:
+        - { Key: Project, Value: voltmart }
+
+  # =========================================================================
+  # Alarms
+  # =========================================================================
+  AlarmTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${NamePrefix}-alarms'
+      DisplayName: VoltMart alarms
+      Tags:
+        - { Key: Project, Value: voltmart }
+
+  AlarmSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasAlarmEmail
+    Properties:
+      TopicArn: !Ref AlarmTopic
+      Protocol: email
+      Endpoint: !Ref AlarmEmail
+
+  # The alarm that matters most in this architecture. A failed compensation
+  # means the checkout saga could not undo itself: stock is reserved against
+  # an order that will never ship, and only a human can reconcile it. Unlike
+  # a payment decline (normal) or a 500 (retryable), this one leaves durable
+  # inconsistency behind.
+  CompensationFailureAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${NamePrefix}-saga-compensation-failed'
+      AlarmDescription: >-
+        A checkout compensation failed, so the system is inconsistent:
+        inventory is reserved for an order that was not completed. Needs
+        manual reconciliation. Check the voltmart-checkout logs for
+        "COMPENSATION FAILED".
+      Namespace: VoltMart
+      MetricName: voltmart.checkout.compensations
+      Dimensions:
+        - { Name: succeeded, Value: 'false' }
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      # Missing data is the normal state: no compensations ran, so no data
+      # points exist. Treating it as breaching would alarm constantly.
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopic]
+
+  CheckoutFailureRateAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${NamePrefix}-checkout-failures'
+      AlarmDescription: >-
+        Checkouts are failing for reasons other than a declined card.
+        Investigate the checkout traces in X-Ray.
+      Namespace: VoltMart
+      MetricName: voltmart.checkout.attempts
+      Dimensions:
+        - { Name: outcome, Value: internal_error }
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 5
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopic]
+
+  AgentErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${NamePrefix}-agent-errors'
+      AlarmDescription: >-
+        The support agent is failing. Most often this is Bedrock model access
+        not being enabled, or a retired model id. Check
+        GET /agent/diagnostics on the support-agent service.
+      Namespace: VoltMart
+      MetricName: voltmart.agent.conversations
+      Dimensions:
+        - { Name: outcome, Value: error }
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 3
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopic]
+
+  # =========================================================================
+  # Dashboard
+  # =========================================================================
+  Dashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub '${NamePrefix}-overview'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "text", "x": 0, "y": 0, "width": 24, "height": 2,
+              "properties": {
+                "markdown": "# VoltMart\nBusiness metrics from the application's own instrumentation. Traces are in [X-Ray](/xray/home?region=${AWS::Region}#/service-map); logs are in `/aws/voltmart/application`.\n\nAll metrics appear only after the first traffic reaches the stack — an empty widget means no orders yet, not a broken pipeline."
+              }
+            },
+            {
+              "type": "metric", "x": 0, "y": 2, "width": 12, "height": 6,
+              "properties": {
+                "title": "Checkout outcomes",
+                "view": "timeSeries", "stacked": false,
+                "region": "${AWS::Region}",
+                "metrics": [
+                  [ "VoltMart", "voltmart.checkout.attempts", "outcome", "success", { "label": "Succeeded", "color": "#2ca02c" } ],
+                  [ "...", "outcome", "payment_declined", { "label": "Card declined", "color": "#ff7f0e" } ],
+                  [ "...", "outcome", "out_of_stock", { "label": "Out of stock", "color": "#9467bd" } ],
+                  [ "...", "outcome", "internal_error", { "label": "Error", "color": "#d62728" } ]
+                ],
+                "period": 300, "stat": "Sum"
+              }
+            },
+            {
+              "type": "metric", "x": 12, "y": 2, "width": 12, "height": 6,
+              "properties": {
+                "title": "Checkout duration (p50 / p99)",
+                "view": "timeSeries",
+                "region": "${AWS::Region}",
+                "metrics": [
+                  [ "VoltMart", "voltmart.checkout.duration", { "label": "p50", "stat": "p50" } ],
+                  [ "...", { "label": "p99", "stat": "p99" } ]
+                ],
+                "period": 300
+              }
+            },
+            {
+              "type": "metric", "x": 0, "y": 8, "width": 8, "height": 6,
+              "properties": {
+                "title": "Orders and revenue",
+                "view": "timeSeries",
+                "region": "${AWS::Region}",
+                "metrics": [
+                  [ "VoltMart", "voltmart.orders.created", { "label": "Orders", "stat": "Sum" } ],
+                  [ "VoltMart", "voltmart.orders.value", { "label": "Avg order value", "stat": "Average", "yAxis": "right" } ]
+                ],
+                "period": 300
+              }
+            },
+            {
+              "type": "metric", "x": 8, "y": 8, "width": 8, "height": 6,
+              "properties": {
+                "title": "Payment outcomes",
+                "view": "timeSeries", "stacked": true,
+                "region": "${AWS::Region}",
+                "metrics": [
+                  [ "VoltMart", "voltmart.payments.attempts", "outcome", "authorized", { "label": "Authorized" } ],
+                  [ "...", "outcome", "declined", { "label": "Declined" } ],
+                  [ "...", "outcome", "under_review", { "label": "Under review" } ]
+                ],
+                "period": 300, "stat": "Sum"
+              }
+            },
+            {
+              "type": "metric", "x": 16, "y": 8, "width": 8, "height": 6,
+              "properties": {
+                "title": "Saga compensations (any failure needs attention)",
+                "view": "timeSeries",
+                "region": "${AWS::Region}",
+                "metrics": [
+                  [ "VoltMart", "voltmart.checkout.compensations", "succeeded", "true", { "label": "Recovered", "color": "#2ca02c" } ],
+                  [ "...", "succeeded", "false", { "label": "FAILED - reconcile manually", "color": "#d62728" } ]
+                ],
+                "period": 300, "stat": "Sum"
+              }
+            },
+            {
+              "type": "metric", "x": 0, "y": 14, "width": 12, "height": 6,
+              "properties": {
+                "title": "Support agent: tool calls",
+                "view": "timeSeries", "stacked": true,
+                "region": "${AWS::Region}",
+                "metrics": [
+                  [ "VoltMart", "voltmart.agent.tool_calls", { "label": "Tool calls", "stat": "Sum" } ],
+                  [ "VoltMart", "voltmart.agent.conversations", { "label": "Conversations", "stat": "Sum" } ],
+                  [ "VoltMart", "voltmart.agent.escalations", { "label": "Escalated to human", "stat": "Sum" } ]
+                ],
+                "period": 300
+              }
+            },
+            {
+              "type": "metric", "x": 12, "y": 14, "width": 12, "height": 6,
+              "properties": {
+                "title": "Support agent: model tokens (cost driver)",
+                "view": "timeSeries",
+                "region": "${AWS::Region}",
+                "metrics": [
+                  [ "VoltMart", "voltmart.agent.tokens", "direction", "input", { "label": "Input tokens" } ],
+                  [ "...", "direction", "output", { "label": "Output tokens" } ]
+                ],
+                "period": 300, "stat": "Sum"
+              }
+            },
+            {
+              "type": "log", "x": 0, "y": 20, "width": 24, "height": 6,
+              "properties": {
+                "title": "Recent errors across all services",
+                "region": "${AWS::Region}",
+                "query": "SOURCE '/aws/voltmart/application' | fields @timestamp, service, message, trace_id | filter level = 'ERROR' | sort @timestamp desc | limit 50",
+                "view": "table"
+              }
+            }
+          ]
+        }
+
+Outputs:
+  PrometheusWorkspaceId:
+    Value: !Ref PrometheusWorkspace
+  PrometheusWorkspaceArn:
+    Value: !GetAtt PrometheusWorkspace.Arn
+  PrometheusRemoteWriteUrl:
+    Description: The endpoint the ADOT Collector writes metrics to.
+    Value: !Sub '${PrometheusWorkspace.PrometheusEndpoint}api/v1/remote_write'
+  PrometheusQueryUrl:
+    Description: Point Grafana or a PromQL client here.
+    Value: !Sub '${PrometheusWorkspace.PrometheusEndpoint}api/v1/query'
+  ApplicationLogGroupName:
+    Value: !Ref ApplicationLogGroup
+  MetricsLogGroupName:
+    Value: !Ref MetricsLogGroup
+  DeployerLogGroupName:
+    Value: !Ref DeployerLogGroup
+  AlarmTopicArn:
+    Value: !Ref AlarmTopic
+  DashboardUrl:
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${NamePrefix}-overview'

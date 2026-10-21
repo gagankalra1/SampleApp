@@ -1,0 +1,322 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  VoltMart data stores. One DynamoDB table per stateful service, plus the ECR
+  repositories the deployer pushes images to.
+
+# Table design
+# ------------
+# One table per service, not one shared table. Each service owns its own
+# schema and can be redeployed, scaled or deleted without touching another's
+# data — which is the point of separating them in the first place.
+#
+# On-demand billing throughout. A workshop's traffic is spiky and mostly zero,
+# so provisioned capacity would mean either paying for idle or throttling
+# during the demo.
+#
+# Where a table holds short-lived state (carts, agent conversations) a TTL
+# attribute lets DynamoDB expire rows itself, so nothing needs a cleanup job
+# and an abandoned workshop account stops costing storage on its own.
+
+Parameters:
+  NamePrefix:
+    Type: String
+    Description: Prefix for table and repository names, normally the stack name.
+
+  ImageRetentionCount:
+    Type: Number
+    Default: 10
+    MinValue: 1
+    MaxValue: 100
+    Description: How many image versions to keep per repository before expiring the oldest.
+
+Resources:
+  # =========================================================================
+  # DynamoDB
+  # =========================================================================
+  InventoryTable:
+    Type: AWS::DynamoDB::Table
+    # Retain on stack delete would strand tables and confuse a repeat
+    # workshop. This data is seeded fabricated stock; losing it is the point.
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      TableName: !Sub '${NamePrefix}-inventory'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - { AttributeName: product_id, AttributeType: S }
+      KeySchema:
+        - { AttributeName: product_id, KeyType: HASH }
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: false
+      SSESpecification:
+        # AWS-owned key. Encrypted at rest with no key to manage and no KMS
+        # charge; switch to a customer-managed key if the workshop needs to
+        # demonstrate key policies.
+        SSEEnabled: false
+      Tags:
+        - { Key: Project, Value: voltmart }
+        - { Key: Service, Value: inventory }
+
+  CartsTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      TableName: !Sub '${NamePrefix}-carts'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - { AttributeName: cart_id, AttributeType: S }
+        - { AttributeName: customer_id, AttributeType: S }
+      KeySchema:
+        - { AttributeName: cart_id, KeyType: HASH }
+      GlobalSecondaryIndexes:
+        # Lets the support agent find a customer's cart when the browser did
+        # not hand over a cart id.
+        - IndexName: customer-index
+          KeySchema:
+            - { AttributeName: customer_id, KeyType: HASH }
+          Projection:
+            ProjectionType: ALL
+      TimeToLiveSpecification:
+        AttributeName: expires_at
+        Enabled: true
+      Tags:
+        - { Key: Project, Value: voltmart }
+        - { Key: Service, Value: cart }
+
+  OrdersTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      TableName: !Sub '${NamePrefix}-orders'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - { AttributeName: order_id, AttributeType: S }
+        - { AttributeName: customer_id, AttributeType: S }
+      KeySchema:
+        - { AttributeName: order_id, KeyType: HASH }
+      GlobalSecondaryIndexes:
+        # "My orders" is the most common read in the whole application, and
+        # the only way to serve it without scanning the table.
+        - IndexName: customer-index
+          KeySchema:
+            - { AttributeName: customer_id, KeyType: HASH }
+          Projection:
+            ProjectionType: ALL
+      # No TTL. Orders are the system's permanent record; expiring them would
+      # make the order history lie.
+      Tags:
+        - { Key: Project, Value: voltmart }
+        - { Key: Service, Value: orders }
+
+  PaymentsTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      TableName: !Sub '${NamePrefix}-payments'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - { AttributeName: payment_id, AttributeType: S }
+        - { AttributeName: order_id, AttributeType: S }
+      KeySchema:
+        - { AttributeName: payment_id, KeyType: HASH }
+      GlobalSecondaryIndexes:
+        # Every attempt against one order, including the declines — which is
+        # what a support conversation about a failed payment needs.
+        - IndexName: order-index
+          KeySchema:
+            - { AttributeName: order_id, KeyType: HASH }
+          Projection:
+            ProjectionType: ALL
+      Tags:
+        - { Key: Project, Value: voltmart }
+        - { Key: Service, Value: payment }
+
+  ConversationsTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      TableName: !Sub '${NamePrefix}-conversations'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - { AttributeName: conversation_id, AttributeType: S }
+      KeySchema:
+        - { AttributeName: conversation_id, KeyType: HASH }
+      TimeToLiveSpecification:
+        # Support transcripts are the most personal data the stack holds, and
+        # they are worthless after the conversation ends. A 24-hour TTL (set
+        # by the service) deletes them without anyone having to remember.
+        AttributeName: expires_at
+        Enabled: true
+      Tags:
+        - { Key: Project, Value: voltmart }
+        - { Key: Service, Value: support-agent }
+
+  # =========================================================================
+  # ECR
+  # =========================================================================
+  # One repository per image. Scan-on-push is on: a workshop image built from
+  # a six-month-old base layer should say so rather than quietly ship known
+  # CVEs.
+  CatalogRepository:
+    Type: AWS::ECR::Repository
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      RepositoryName: !Sub '${NamePrefix}/catalog'
+      # Lets the stack delete cleanly without a manual image purge first.
+      EmptyOnDelete: true
+      ImageScanningConfiguration:
+        ScanOnPush: true
+      ImageTagMutability: IMMUTABLE
+      LifecyclePolicy:
+        LifecyclePolicyText: !Sub |
+          {
+            "rules": [
+              {
+                "rulePriority": 1,
+                "description": "Expire all but the newest ${ImageRetentionCount} images",
+                "selection": {
+                  "tagStatus": "any",
+                  "countType": "imageCountMoreThan",
+                  "countNumber": ${ImageRetentionCount}
+                },
+                "action": { "type": "expire" }
+              }
+            ]
+          }
+      Tags:
+        - { Key: Project, Value: voltmart }
+
+  InventoryRepository:
+    Type: AWS::ECR::Repository
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      RepositoryName: !Sub '${NamePrefix}/inventory'
+      EmptyOnDelete: true
+      ImageScanningConfiguration: { ScanOnPush: true }
+      ImageTagMutability: IMMUTABLE
+      LifecyclePolicy:
+        LifecyclePolicyText: !Sub |
+          {"rules":[{"rulePriority":1,"description":"retention","selection":{"tagStatus":"any","countType":"imageCountMoreThan","countNumber":${ImageRetentionCount}},"action":{"type":"expire"}}]}
+      Tags:
+        - { Key: Project, Value: voltmart }
+
+  CartRepository:
+    Type: AWS::ECR::Repository
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      RepositoryName: !Sub '${NamePrefix}/cart'
+      EmptyOnDelete: true
+      ImageScanningConfiguration: { ScanOnPush: true }
+      ImageTagMutability: IMMUTABLE
+      LifecyclePolicy:
+        LifecyclePolicyText: !Sub |
+          {"rules":[{"rulePriority":1,"description":"retention","selection":{"tagStatus":"any","countType":"imageCountMoreThan","countNumber":${ImageRetentionCount}},"action":{"type":"expire"}}]}
+      Tags:
+        - { Key: Project, Value: voltmart }
+
+  OrdersRepository:
+    Type: AWS::ECR::Repository
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      RepositoryName: !Sub '${NamePrefix}/orders'
+      EmptyOnDelete: true
+      ImageScanningConfiguration: { ScanOnPush: true }
+      ImageTagMutability: IMMUTABLE
+      LifecyclePolicy:
+        LifecyclePolicyText: !Sub |
+          {"rules":[{"rulePriority":1,"description":"retention","selection":{"tagStatus":"any","countType":"imageCountMoreThan","countNumber":${ImageRetentionCount}},"action":{"type":"expire"}}]}
+      Tags:
+        - { Key: Project, Value: voltmart }
+
+  PaymentRepository:
+    Type: AWS::ECR::Repository
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      RepositoryName: !Sub '${NamePrefix}/payment'
+      EmptyOnDelete: true
+      ImageScanningConfiguration: { ScanOnPush: true }
+      ImageTagMutability: IMMUTABLE
+      LifecyclePolicy:
+        LifecyclePolicyText: !Sub |
+          {"rules":[{"rulePriority":1,"description":"retention","selection":{"tagStatus":"any","countType":"imageCountMoreThan","countNumber":${ImageRetentionCount}},"action":{"type":"expire"}}]}
+      Tags:
+        - { Key: Project, Value: voltmart }
+
+  CheckoutRepository:
+    Type: AWS::ECR::Repository
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      RepositoryName: !Sub '${NamePrefix}/checkout'
+      EmptyOnDelete: true
+      ImageScanningConfiguration: { ScanOnPush: true }
+      ImageTagMutability: IMMUTABLE
+      LifecyclePolicy:
+        LifecyclePolicyText: !Sub |
+          {"rules":[{"rulePriority":1,"description":"retention","selection":{"tagStatus":"any","countType":"imageCountMoreThan","countNumber":${ImageRetentionCount}},"action":{"type":"expire"}}]}
+      Tags:
+        - { Key: Project, Value: voltmart }
+
+  SupportAgentRepository:
+    Type: AWS::ECR::Repository
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      RepositoryName: !Sub '${NamePrefix}/support-agent'
+      EmptyOnDelete: true
+      ImageScanningConfiguration: { ScanOnPush: true }
+      ImageTagMutability: IMMUTABLE
+      LifecyclePolicy:
+        LifecyclePolicyText: !Sub |
+          {"rules":[{"rulePriority":1,"description":"retention","selection":{"tagStatus":"any","countType":"imageCountMoreThan","countNumber":${ImageRetentionCount}},"action":{"type":"expire"}}]}
+      Tags:
+        - { Key: Project, Value: voltmart }
+
+  FrontendRepository:
+    Type: AWS::ECR::Repository
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      RepositoryName: !Sub '${NamePrefix}/frontend'
+      EmptyOnDelete: true
+      ImageScanningConfiguration: { ScanOnPush: true }
+      ImageTagMutability: IMMUTABLE
+      LifecyclePolicy:
+        LifecyclePolicyText: !Sub |
+          {"rules":[{"rulePriority":1,"description":"retention","selection":{"tagStatus":"any","countType":"imageCountMoreThan","countNumber":${ImageRetentionCount}},"action":{"type":"expire"}}]}
+      Tags:
+        - { Key: Project, Value: voltmart }
+
+Outputs:
+  InventoryTableName:
+    Value: !Ref InventoryTable
+  InventoryTableArn:
+    Value: !GetAtt InventoryTable.Arn
+  CartsTableName:
+    Value: !Ref CartsTable
+  CartsTableArn:
+    Value: !GetAtt CartsTable.Arn
+  OrdersTableName:
+    Value: !Ref OrdersTable
+  OrdersTableArn:
+    Value: !GetAtt OrdersTable.Arn
+  PaymentsTableName:
+    Value: !Ref PaymentsTable
+  PaymentsTableArn:
+    Value: !GetAtt PaymentsTable.Arn
+  ConversationsTableName:
+    Value: !Ref ConversationsTable
+  ConversationsTableArn:
+    Value: !GetAtt ConversationsTable.Arn
+  RegistryUri:
+    Description: Base URI all VoltMart images are pushed under.
+    Value: !Sub '${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${NamePrefix}'

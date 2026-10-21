@@ -1,0 +1,380 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  VoltMart — an electronics storefront built as microservices on Amazon EKS,
+  with a Strands-powered support agent and OpenTelemetry telemetry throughout.
+  Deploys the whole thing: network, cluster, data stores, observability
+  backends, container images and the running application.
+
+# ---------------------------------------------------------------------------
+# What you get
+# ---------------------------------------------------------------------------
+# A VPC across two AZs, an EKS cluster with a managed node group in private
+# subnets, five DynamoDB tables, eight ECR repositories, a Prometheus
+# workspace, a CloudWatch dashboard with alarms, and nine workloads running
+# behind one internet-facing load balancer.
+#
+# The stack builds the container images itself. There is nothing to build or
+# push by hand, which is what makes it launchable in a fresh account.
+#
+# ---------------------------------------------------------------------------
+# Before you launch
+# ---------------------------------------------------------------------------
+# 1. Publish the assets:  ./scripts/publish-assets.sh --bucket <your-bucket>
+#    That uploads these templates and a source archive, and prints a ready
+#    made launch command.
+#
+# 2. Enable Bedrock model access for the model in BedrockModelId, in the
+#    region you are deploying to. Everything else works without it; only the
+#    support agent needs it, and it reports the exact problem on
+#    GET /agent/diagnostics if access is missing.
+#
+# 3. Decide on AllowedIngressCidr. The default 0.0.0.0/0 publishes the
+#    storefront — including the Bedrock-backed agent endpoint — to the whole
+#    internet. For a workshop, set it to your venue or VPN range.
+#
+# ---------------------------------------------------------------------------
+# Running cost, roughly, in us-west-2
+# ---------------------------------------------------------------------------
+#   EKS control plane       $0.10/hour
+#   3x t3.large nodes       $0.25/hour
+#   NAT gateway (single)    $0.045/hour + data
+#   ALB                     $0.025/hour + LCU
+#   DynamoDB, ECR, logs     cents at workshop volume
+#   Bedrock                 per token, only when the agent is used
+#
+# About $0.45/hour, so roughly $11 a day if left running. Delete the stack
+# when the workshop ends — it is built to delete cleanly, including the load
+# balancer that Kubernetes creates outside CloudFormation.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label: { default: Source assets (required) }
+        Parameters: [AssetsBucket, AssetsPrefix]
+      - Label: { default: Access and exposure }
+        Parameters: [AllowedIngressCidr, AdminPrincipalArn]
+      - Label: { default: Cluster sizing }
+        Parameters: [KubernetesVersion, NodeInstanceType, DesiredNodeCount, MaxNodeCount]
+      - Label: { default: Support agent }
+        Parameters: [BedrockModelId]
+      - Label: { default: Network }
+        Parameters: [VpcCidr, SingleNatGateway]
+      - Label: { default: Observability }
+        Parameters: [LogRetentionDays, AlarmEmail]
+      - Label: { default: Advanced }
+        Parameters: [DeployTimeoutMinutes, ImageRetentionCount]
+    ParameterLabels:
+      AssetsBucket: { default: Assets S3 bucket }
+      AssetsPrefix: { default: Assets key prefix }
+      AllowedIngressCidr: { default: CIDR allowed to reach the storefront }
+      AdminPrincipalArn: { default: Your IAM role ARN (for kubectl access) }
+      BedrockModelId: { default: Bedrock model id }
+      KubernetesVersion: { default: Kubernetes version (blank = EKS default) }
+
+Parameters:
+  # ---- Source assets ----------------------------------------------------
+  AssetsBucket:
+    Type: String
+    MinLength: 3
+    Description: >-
+      S3 bucket containing the published templates and source.zip. Created and
+      populated by scripts/publish-assets.sh.
+
+  AssetsPrefix:
+    Type: String
+    Default: voltmart/latest
+    Description: >-
+      Key prefix under which the assets were published. Changing this on a
+      stack update is what triggers a redeploy of new code.
+
+  # ---- Access -----------------------------------------------------------
+  AllowedIngressCidr:
+    Type: String
+    Default: 0.0.0.0/0
+    AllowedPattern: '^(\d{1,3}\.){3}\d{1,3}/\d{1,2}$'
+    Description: >-
+      CIDR allowed to reach the public load balancer. 0.0.0.0/0 exposes the
+      storefront and the AI agent endpoint to the internet; the agent costs
+      money per request, so narrow this for anything longer than a workshop.
+
+  AdminPrincipalArn:
+    Type: String
+    Default: ''
+    Description: >-
+      Your IAM role or user ARN, granted cluster-admin so you can run
+      kubectl. Find it with: aws sts get-caller-identity. Leave blank to skip,
+      but then only the stack's own build role can reach the cluster.
+
+  # ---- Cluster ----------------------------------------------------------
+  KubernetesVersion:
+    Type: String
+    Default: ''
+    Description: >-
+      Kubernetes minor version such as 1.34. Leave blank to take the EKS
+      default, which keeps this template working as versions age out.
+
+  NodeInstanceType:
+    Type: String
+    Default: t3.large
+    AllowedValues: [t3.large, t3.xlarge, m5.large, m5.xlarge, m6i.large, m6i.xlarge, c6i.xlarge]
+    Description: Worker node instance type. t3.large runs the full stack.
+
+  DesiredNodeCount:
+    Type: Number
+    Default: 3
+    MinValue: 2
+    MaxValue: 10
+
+  MaxNodeCount:
+    Type: Number
+    Default: 6
+    MinValue: 2
+    MaxValue: 20
+
+  # ---- Agent ------------------------------------------------------------
+  BedrockModelId:
+    Type: String
+    Default: us.anthropic.claude-sonnet-4-5-20250929-v1:0
+    Description: >-
+      Cross-region inference profile for the support agent. Must be enabled
+      for your account in this region. List valid ids with:
+      aws bedrock list-inference-profiles --region <region>
+
+  # ---- Network ----------------------------------------------------------
+  VpcCidr:
+    Type: String
+    Default: 10.0.0.0/16
+    AllowedPattern: '^(\d{1,3}\.){3}\d{1,3}/\d{1,2}$'
+
+  SingleNatGateway:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: >-
+      One NAT gateway instead of one per AZ. Saves about $32/month and
+      accepts an AZ-level single point of failure.
+
+  # ---- Observability ----------------------------------------------------
+  LogRetentionDays:
+    Type: Number
+    Default: 7
+    AllowedValues: [1, 3, 5, 7, 14, 30, 60, 90, 180, 365]
+
+  AlarmEmail:
+    Type: String
+    Default: ''
+    AllowedPattern: '^$|^[^@\s]+@[^@\s]+\.[^@\s]+$'
+    Description: Optional email for alarm notifications. You will get a confirmation request.
+
+  # ---- Advanced ---------------------------------------------------------
+  DeployTimeoutMinutes:
+    Type: Number
+    Default: 45
+    MinValue: 15
+    MaxValue: 120
+
+  ImageRetentionCount:
+    Type: Number
+    Default: 10
+    MinValue: 1
+    MaxValue: 100
+
+Resources:
+  # =========================================================================
+  # 1. Network
+  # =========================================================================
+  NetworkStack:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: !Sub 'https://${AssetsBucket}.s3.${AWS::Region}.amazonaws.com/${AssetsPrefix}/templates/network.yaml'
+      TimeoutInMinutes: 30
+      Parameters:
+        VpcCidr: !Ref VpcCidr
+        SingleNatGateway: !Ref SingleNatGateway
+        # The cluster name is derived from the stack name rather than taken as
+        # a parameter, so two stacks in one account can never collide on it.
+        ClusterName: !Ref 'AWS::StackName'
+      Tags:
+        - { Key: Project, Value: voltmart }
+
+  # =========================================================================
+  # 2. Data stores and image repositories
+  # =========================================================================
+  DataStack:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: !Sub 'https://${AssetsBucket}.s3.${AWS::Region}.amazonaws.com/${AssetsPrefix}/templates/data.yaml'
+      TimeoutInMinutes: 30
+      Parameters:
+        NamePrefix: !Ref 'AWS::StackName'
+        ImageRetentionCount: !Ref ImageRetentionCount
+      Tags:
+        - { Key: Project, Value: voltmart }
+
+  # =========================================================================
+  # 3. Observability backends
+  # =========================================================================
+  ObservabilityStack:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: !Sub 'https://${AssetsBucket}.s3.${AWS::Region}.amazonaws.com/${AssetsPrefix}/templates/observability.yaml'
+      TimeoutInMinutes: 30
+      Parameters:
+        NamePrefix: !Ref 'AWS::StackName'
+        LogRetentionDays: !Ref LogRetentionDays
+        AlarmEmail: !Ref AlarmEmail
+      Tags:
+        - { Key: Project, Value: voltmart }
+
+  # =========================================================================
+  # 4. The deployer's IAM role
+  # =========================================================================
+  # Created before the cluster because the cluster's access entry needs this
+  # ARN. See nested/deployer-role.yaml for why it is not inside the deployer
+  # stack.
+  DeployerRoleStack:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: !Sub 'https://${AssetsBucket}.s3.${AWS::Region}.amazonaws.com/${AssetsPrefix}/templates/deployer-role.yaml'
+      TimeoutInMinutes: 15
+      Parameters:
+        NamePrefix: !Ref 'AWS::StackName'
+        AssetsBucket: !Ref AssetsBucket
+        AssetsPrefix: !Ref AssetsPrefix
+      Tags:
+        - { Key: Project, Value: voltmart }
+
+  # =========================================================================
+  # 5. EKS cluster
+  # =========================================================================
+  ClusterStack:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: !Sub 'https://${AssetsBucket}.s3.${AWS::Region}.amazonaws.com/${AssetsPrefix}/templates/cluster.yaml'
+      # The slowest stack by far: control plane creation alone is 8-10
+      # minutes, and the node group and add-ons follow.
+      TimeoutInMinutes: 60
+      Parameters:
+        ClusterName: !Ref 'AWS::StackName'
+        KubernetesVersion: !Ref KubernetesVersion
+        VpcId: !GetAtt NetworkStack.Outputs.VpcId
+        PrivateSubnetIds: !GetAtt NetworkStack.Outputs.PrivateSubnetIds
+        PublicSubnetIds: !GetAtt NetworkStack.Outputs.PublicSubnetIds
+        NodeInstanceType: !Ref NodeInstanceType
+        DesiredNodeCount: !Ref DesiredNodeCount
+        MaxNodeCount: !Ref MaxNodeCount
+        AdminPrincipalArn: !Ref AdminPrincipalArn
+        DeployerRoleArn: !GetAtt DeployerRoleStack.Outputs.DeployerRoleArn
+      Tags:
+        - { Key: Project, Value: voltmart }
+
+  # =========================================================================
+  # 6. Per-service IAM roles and pod identity associations
+  # =========================================================================
+  IdentityStack:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: !Sub 'https://${AssetsBucket}.s3.${AWS::Region}.amazonaws.com/${AssetsPrefix}/templates/identity.yaml'
+      TimeoutInMinutes: 30
+      Parameters:
+        ClusterName: !GetAtt ClusterStack.Outputs.ClusterName
+        NamePrefix: !Ref 'AWS::StackName'
+        InventoryTableArn: !GetAtt DataStack.Outputs.InventoryTableArn
+        CartsTableArn: !GetAtt DataStack.Outputs.CartsTableArn
+        OrdersTableArn: !GetAtt DataStack.Outputs.OrdersTableArn
+        PaymentsTableArn: !GetAtt DataStack.Outputs.PaymentsTableArn
+        ConversationsTableArn: !GetAtt DataStack.Outputs.ConversationsTableArn
+        PrometheusWorkspaceArn: !GetAtt ObservabilityStack.Outputs.PrometheusWorkspaceArn
+        BedrockModelId: !Ref BedrockModelId
+      Tags:
+        - { Key: Project, Value: voltmart }
+
+  # =========================================================================
+  # 7. Build the images and deploy the application
+  # =========================================================================
+  DeployerStack:
+    Type: AWS::CloudFormation::Stack
+    # Ordering against the identity stack matters — the pod identity
+    # associations must exist before the pods start, or every service's first
+    # action is a failed DynamoDB call — and is already enforced by the
+    # LoadBalancerControllerRoleArn reference below.
+    Properties:
+      TemplateURL: !Sub 'https://${AssetsBucket}.s3.${AWS::Region}.amazonaws.com/${AssetsPrefix}/templates/deployer.yaml'
+      TimeoutInMinutes: 90
+      Parameters:
+        NamePrefix: !Ref 'AWS::StackName'
+        ClusterName: !GetAtt ClusterStack.Outputs.ClusterName
+        AssetsBucket: !Ref AssetsBucket
+        AssetsPrefix: !Ref AssetsPrefix
+        RegistryUri: !GetAtt DataStack.Outputs.RegistryUri
+        DeployerRoleArn: !GetAtt DeployerRoleStack.Outputs.DeployerRoleArn
+        LoadBalancerControllerRoleArn: !GetAtt IdentityStack.Outputs.LoadBalancerControllerRoleArn
+        VpcId: !GetAtt NetworkStack.Outputs.VpcId
+        PrometheusRemoteWriteUrl: !GetAtt ObservabilityStack.Outputs.PrometheusRemoteWriteUrl
+        InventoryTableName: !GetAtt DataStack.Outputs.InventoryTableName
+        CartsTableName: !GetAtt DataStack.Outputs.CartsTableName
+        OrdersTableName: !GetAtt DataStack.Outputs.OrdersTableName
+        PaymentsTableName: !GetAtt DataStack.Outputs.PaymentsTableName
+        ConversationsTableName: !GetAtt DataStack.Outputs.ConversationsTableName
+        BedrockModelId: !Ref BedrockModelId
+        AllowedIngressCidr: !Ref AllowedIngressCidr
+        DeployerLogGroupName: !GetAtt ObservabilityStack.Outputs.DeployerLogGroupName
+        DeployTimeoutMinutes: !Ref DeployTimeoutMinutes
+      Tags:
+        - { Key: Project, Value: voltmart }
+
+Outputs:
+  StorefrontUrl:
+    Description: >-
+      Open this. The deploy build waits for the load balancer to actually
+      serve traffic before the stack completes, so it works immediately.
+    Value: !GetAtt DeployerStack.Outputs.StorefrontUrl
+
+  ClusterName:
+    Description: EKS cluster name.
+    Value: !GetAtt ClusterStack.Outputs.ClusterName
+
+  KubeconfigCommand:
+    Description: Run this to point kubectl at the cluster.
+    Value: !Sub
+      - 'aws eks update-kubeconfig --region ${AWS::Region} --name ${Name}'
+      - Name: !GetAtt ClusterStack.Outputs.ClusterName
+
+  DashboardUrl:
+    Description: CloudWatch dashboard with the business metrics.
+    Value: !GetAtt ObservabilityStack.Outputs.DashboardUrl
+
+  ServiceMapUrl:
+    Description: X-Ray service map — the live picture of which service calls which.
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/xray/home?region=${AWS::Region}#/service-map'
+
+  TracesUrl:
+    Description: X-Ray traces. Filter on the voltmart-checkout service to see the saga.
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/xray/home?region=${AWS::Region}#/traces'
+
+  LogsUrl:
+    Description: Application logs from every service, correlated by trace id.
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#logsV2:log-groups/log-group/$252Faws$252Fvoltmart$252Fapplication'
+
+  PrometheusQueryUrl:
+    Description: Point Grafana or a PromQL client at this endpoint.
+    Value: !GetAtt ObservabilityStack.Outputs.PrometheusQueryUrl
+
+  DeployerProject:
+    Description: >-
+      CodeBuild project that built and deployed the app. Start it again to
+      redeploy after changing the published source.
+    Value: !GetAtt DeployerStack.Outputs.DeployerProjectName
+
+  RegistryUri:
+    Description: ECR base URI the images were pushed to.
+    Value: !GetAtt DataStack.Outputs.RegistryUri
+
+  NextSteps:
+    Description: What to do once the stack is complete.
+    Value: !Sub >-
+      1) Open StorefrontUrl and buy something with card 4242424242424242.
+      2) Click "Ask Volt" and try "where is my order".
+      3) Open ServiceMapUrl to see the trace of what just happened.
+      If the agent says it is unavailable, check Bedrock model access for
+      ${BedrockModelId} in ${AWS::Region}.

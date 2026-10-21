@@ -1,0 +1,14 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: voltmart
+  labels:
+    app.kubernetes.io/part-of: voltmart
+    # Enforce the restricted Pod Security Standard. Every workload here runs
+    # unprivileged with a read-only root filesystem and no added capabilities,
+    # so enforcing the strictest profile costs nothing and stops a future
+    # manifest from quietly introducing a privileged container.
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/enforce-version: latest
+    pod-security.kubernetes.io/audit: restricted
+    pod-security.kubernetes.io/warn: restricted

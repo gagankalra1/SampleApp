@@ -1,0 +1,628 @@
+# The six VoltMart business services.
+#
+# They are grouped in one file because they are structurally identical: same
+# base image recipe, same probes, same security context, same telemetry
+# configuration. The things that differ are called out per service.
+#
+# Every Service here is ClusterIP. None of them has an Ingress. The only way
+# in from outside the cluster is through the frontend pod's nginx, which
+# proxies a deliberate allowlist of paths — and does not proxy the payment
+# service at all.
+#
+# Each Deployment shares these properties:
+#   * runs as uid 10001, non-root, read-only root filesystem, no capabilities
+#   * liveness probe never touches a dependency (so a DynamoDB blip cannot
+#     restart every pod and turn a partial outage into a total one)
+#   * readiness probe does check dependencies (so a pod that cannot serve is
+#     taken out of the Service)
+#   * pod identity rather than static credentials for AWS access
+
+# ===========================================================================
+# Catalog — product data. Stateless: the catalog is a JSON file in the image,
+# so this service needs no table and no AWS permissions at all.
+# ===========================================================================
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: voltmart-catalog
+  namespace: voltmart
+  labels: { app.kubernetes.io/name: catalog, app.kubernetes.io/part-of: voltmart }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: voltmart-catalog
+  namespace: voltmart
+  labels: { app.kubernetes.io/name: catalog, app.kubernetes.io/part-of: voltmart }
+spec:
+  type: ClusterIP
+  selector: { app.kubernetes.io/name: catalog, app.kubernetes.io/part-of: voltmart }
+  ports: [{ name: http, port: 8080, targetPort: http, protocol: TCP }]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: voltmart-catalog
+  namespace: voltmart
+  labels: { app.kubernetes.io/name: catalog, app.kubernetes.io/part-of: voltmart }
+spec:
+  replicas: 2
+  revisionHistoryLimit: 3
+  selector:
+    matchLabels: { app.kubernetes.io/name: catalog, app.kubernetes.io/part-of: voltmart }
+  strategy:
+    type: RollingUpdate
+    rollingUpdate: { maxSurge: 1, maxUnavailable: 0 }
+  template:
+    metadata:
+      labels: { app.kubernetes.io/name: catalog, app.kubernetes.io/part-of: voltmart }
+    spec:
+      serviceAccountName: voltmart-catalog
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        seccompProfile: { type: RuntimeDefault }
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels: { app.kubernetes.io/name: catalog }
+      containers:
+        - name: catalog
+          image: voltmart/catalog:latest
+          imagePullPolicy: IfNotPresent
+          ports: [{ name: http, containerPort: 8080 }]
+          envFrom:
+            - configMapRef: { name: voltmart-config }
+          env:
+            - name: OTEL_SERVICE_NAME
+              value: voltmart-catalog
+            # Overrides the namespace default: no table, nothing to persist.
+            - name: STORAGE_BACKEND
+              value: memory
+            - name: K8S_POD_NAME
+              valueFrom: { fieldRef: { fieldPath: metadata.name } }
+            - name: K8S_NAMESPACE
+              valueFrom: { fieldRef: { fieldPath: metadata.namespace } }
+            - name: K8S_NODE_NAME
+              valueFrom: { fieldRef: { fieldPath: spec.nodeName } }
+          resources:
+            requests: { cpu: 50m, memory: 192Mi }
+            limits: { memory: 384Mi }
+          startupProbe:
+            httpGet: { path: /health, port: http }
+            failureThreshold: 20
+            periodSeconds: 3
+          livenessProbe:
+            httpGet: { path: /health, port: http }
+            periodSeconds: 20
+            timeoutSeconds: 3
+          readinessProbe:
+            httpGet: { path: /ready, port: http }
+            periodSeconds: 10
+            timeoutSeconds: 3
+          lifecycle:
+            preStop:
+              # Give the Service endpoint removal time to propagate before the
+              # process stops, so a rolling update does not drop in-flight
+              # requests.
+              exec: { command: ["sleep", "5"] }
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: ["ALL"] }
+          volumeMounts:
+            - { name: tmp, mountPath: /tmp }
+      volumes:
+        - name: tmp
+          emptyDir: { sizeLimit: 64Mi }
+
+# ===========================================================================
+# Inventory — stock levels. The only service with a hard correctness
+# constraint (stock must never go negative), enforced by conditional atomic
+# updates in DynamoDB.
+# ===========================================================================
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: voltmart-inventory
+  namespace: voltmart
+  labels: { app.kubernetes.io/name: inventory, app.kubernetes.io/part-of: voltmart }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: voltmart-inventory
+  namespace: voltmart
+  labels: { app.kubernetes.io/name: inventory, app.kubernetes.io/part-of: voltmart }
+spec:
+  type: ClusterIP
+  selector: { app.kubernetes.io/name: inventory, app.kubernetes.io/part-of: voltmart }
+  ports: [{ name: http, port: 8080, targetPort: http, protocol: TCP }]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: voltmart-inventory
+  namespace: voltmart
+  labels: { app.kubernetes.io/name: inventory, app.kubernetes.io/part-of: voltmart }
+spec:
+  replicas: 2
+  revisionHistoryLimit: 3
+  selector:
+    matchLabels: { app.kubernetes.io/name: inventory, app.kubernetes.io/part-of: voltmart }
+  strategy:
+    type: RollingUpdate
+    rollingUpdate: { maxSurge: 1, maxUnavailable: 0 }
+  template:
+    metadata:
+      labels: { app.kubernetes.io/name: inventory, app.kubernetes.io/part-of: voltmart }
+    spec:
+      serviceAccountName: voltmart-inventory
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        seccompProfile: { type: RuntimeDefault }
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels: { app.kubernetes.io/name: inventory }
+      containers:
+        - name: inventory
+          image: voltmart/inventory:latest
+          imagePullPolicy: IfNotPresent
+          ports: [{ name: http, containerPort: 8080 }]
+          envFrom:
+            - configMapRef: { name: voltmart-config }
+          env:
+            - name: OTEL_SERVICE_NAME
+              value: voltmart-inventory
+            - name: TABLE_NAME
+              valueFrom: { configMapKeyRef: { name: voltmart-tables, key: INVENTORY_TABLE } }
+            - name: K8S_POD_NAME
+              valueFrom: { fieldRef: { fieldPath: metadata.name } }
+            - name: K8S_NAMESPACE
+              valueFrom: { fieldRef: { fieldPath: metadata.namespace } }
+            - name: K8S_NODE_NAME
+              valueFrom: { fieldRef: { fieldPath: spec.nodeName } }
+          resources:
+            requests: { cpu: 50m, memory: 192Mi }
+            limits: { memory: 384Mi }
+          startupProbe:
+            httpGet: { path: /health, port: http }
+            failureThreshold: 20
+            periodSeconds: 3
+          livenessProbe:
+            httpGet: { path: /health, port: http }
+            periodSeconds: 20
+            timeoutSeconds: 3
+          readinessProbe:
+            httpGet: { path: /ready, port: http }
+            periodSeconds: 10
+            timeoutSeconds: 3
+          lifecycle:
+            preStop:
+              exec: { command: ["sleep", "5"] }
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: ["ALL"] }
+          volumeMounts:
+            - { name: tmp, mountPath: /tmp }
+      volumes:
+        - name: tmp
+          emptyDir: { sizeLimit: 64Mi }
+
+# ===========================================================================
+# Cart — shopping carts. Calls catalog (to price) and inventory (to annotate
+# availability), and tolerates inventory being down.
+# ===========================================================================
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: voltmart-cart
+  namespace: voltmart
+  labels: { app.kubernetes.io/name: cart, app.kubernetes.io/part-of: voltmart }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: voltmart-cart
+  namespace: voltmart
+  labels: { app.kubernetes.io/name: cart, app.kubernetes.io/part-of: voltmart }
+spec:
+  type: ClusterIP
+  selector: { app.kubernetes.io/name: cart, app.kubernetes.io/part-of: voltmart }
+  ports: [{ name: http, port: 8080, targetPort: http, protocol: TCP }]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: voltmart-cart
+  namespace: voltmart
+  labels: { app.kubernetes.io/name: cart, app.kubernetes.io/part-of: voltmart }
+spec:
+  replicas: 2
+  revisionHistoryLimit: 3
+  selector:
+    matchLabels: { app.kubernetes.io/name: cart, app.kubernetes.io/part-of: voltmart }
+  strategy:
+    type: RollingUpdate
+    rollingUpdate: { maxSurge: 1, maxUnavailable: 0 }
+  template:
+    metadata:
+      labels: { app.kubernetes.io/name: cart, app.kubernetes.io/part-of: voltmart }
+    spec:
+      serviceAccountName: voltmart-cart
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        seccompProfile: { type: RuntimeDefault }
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels: { app.kubernetes.io/name: cart }
+      containers:
+        - name: cart
+          image: voltmart/cart:latest
+          imagePullPolicy: IfNotPresent
+          ports: [{ name: http, containerPort: 8080 }]
+          envFrom:
+            - configMapRef: { name: voltmart-config }
+          env:
+            - name: OTEL_SERVICE_NAME
+              value: voltmart-cart
+            - name: TABLE_NAME
+              valueFrom: { configMapKeyRef: { name: voltmart-tables, key: CART_TABLE } }
+            - name: K8S_POD_NAME
+              valueFrom: { fieldRef: { fieldPath: metadata.name } }
+            - name: K8S_NAMESPACE
+              valueFrom: { fieldRef: { fieldPath: metadata.namespace } }
+            - name: K8S_NODE_NAME
+              valueFrom: { fieldRef: { fieldPath: spec.nodeName } }
+          resources:
+            requests: { cpu: 50m, memory: 192Mi }
+            limits: { memory: 384Mi }
+          startupProbe:
+            httpGet: { path: /health, port: http }
+            failureThreshold: 20
+            periodSeconds: 3
+          livenessProbe:
+            httpGet: { path: /health, port: http }
+            periodSeconds: 20
+            timeoutSeconds: 3
+          readinessProbe:
+            httpGet: { path: /ready, port: http }
+            periodSeconds: 10
+            timeoutSeconds: 3
+          lifecycle:
+            preStop:
+              exec: { command: ["sleep", "5"] }
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: ["ALL"] }
+          volumeMounts:
+            - { name: tmp, mountPath: /tmp }
+      volumes:
+        - name: tmp
+          emptyDir: { sizeLimit: 64Mi }
+
+# ===========================================================================
+# Orders — the order record and the rules about how it may change.
+# ===========================================================================
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: voltmart-orders
+  namespace: voltmart
+  labels: { app.kubernetes.io/name: orders, app.kubernetes.io/part-of: voltmart }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: voltmart-orders
+  namespace: voltmart
+  labels: { app.kubernetes.io/name: orders, app.kubernetes.io/part-of: voltmart }
+spec:
+  type: ClusterIP
+  selector: { app.kubernetes.io/name: orders, app.kubernetes.io/part-of: voltmart }
+  ports: [{ name: http, port: 8080, targetPort: http, protocol: TCP }]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: voltmart-orders
+  namespace: voltmart
+  labels: { app.kubernetes.io/name: orders, app.kubernetes.io/part-of: voltmart }
+spec:
+  replicas: 2
+  revisionHistoryLimit: 3
+  selector:
+    matchLabels: { app.kubernetes.io/name: orders, app.kubernetes.io/part-of: voltmart }
+  strategy:
+    type: RollingUpdate
+    rollingUpdate: { maxSurge: 1, maxUnavailable: 0 }
+  template:
+    metadata:
+      labels: { app.kubernetes.io/name: orders, app.kubernetes.io/part-of: voltmart }
+    spec:
+      serviceAccountName: voltmart-orders
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        seccompProfile: { type: RuntimeDefault }
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels: { app.kubernetes.io/name: orders }
+      containers:
+        - name: orders
+          image: voltmart/orders:latest
+          imagePullPolicy: IfNotPresent
+          ports: [{ name: http, containerPort: 8080 }]
+          envFrom:
+            - configMapRef: { name: voltmart-config }
+          env:
+            - name: OTEL_SERVICE_NAME
+              value: voltmart-orders
+            - name: TABLE_NAME
+              valueFrom: { configMapKeyRef: { name: voltmart-tables, key: ORDERS_TABLE } }
+            - name: K8S_POD_NAME
+              valueFrom: { fieldRef: { fieldPath: metadata.name } }
+            - name: K8S_NAMESPACE
+              valueFrom: { fieldRef: { fieldPath: metadata.namespace } }
+            - name: K8S_NODE_NAME
+              valueFrom: { fieldRef: { fieldPath: spec.nodeName } }
+          resources:
+            requests: { cpu: 50m, memory: 192Mi }
+            limits: { memory: 384Mi }
+          startupProbe:
+            httpGet: { path: /health, port: http }
+            failureThreshold: 20
+            periodSeconds: 3
+          livenessProbe:
+            httpGet: { path: /health, port: http }
+            periodSeconds: 20
+            timeoutSeconds: 3
+          readinessProbe:
+            httpGet: { path: /ready, port: http }
+            periodSeconds: 10
+            timeoutSeconds: 3
+          lifecycle:
+            preStop:
+              exec: { command: ["sleep", "5"] }
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: ["ALL"] }
+          volumeMounts:
+            - { name: tmp, mountPath: /tmp }
+      volumes:
+        - name: tmp
+          emptyDir: { sizeLimit: 64Mi }
+
+# ===========================================================================
+# Payment — simulated card authorization.
+#
+# This is the one service with no route through the frontend proxy. The
+# browser never calls it; only checkout does, pod to pod. The NetworkPolicy
+# enforces that at the network layer as well.
+# ===========================================================================
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: voltmart-payment
+  namespace: voltmart
+  labels: { app.kubernetes.io/name: payment, app.kubernetes.io/part-of: voltmart }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: voltmart-payment
+  namespace: voltmart
+  labels: { app.kubernetes.io/name: payment, app.kubernetes.io/part-of: voltmart }
+spec:
+  type: ClusterIP
+  selector: { app.kubernetes.io/name: payment, app.kubernetes.io/part-of: voltmart }
+  ports: [{ name: http, port: 8080, targetPort: http, protocol: TCP }]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: voltmart-payment
+  namespace: voltmart
+  labels: { app.kubernetes.io/name: payment, app.kubernetes.io/part-of: voltmart }
+spec:
+  replicas: 2
+  revisionHistoryLimit: 3
+  selector:
+    matchLabels: { app.kubernetes.io/name: payment, app.kubernetes.io/part-of: voltmart }
+  strategy:
+    type: RollingUpdate
+    rollingUpdate: { maxSurge: 1, maxUnavailable: 0 }
+  template:
+    metadata:
+      labels: { app.kubernetes.io/name: payment, app.kubernetes.io/part-of: voltmart }
+    spec:
+      serviceAccountName: voltmart-payment
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        seccompProfile: { type: RuntimeDefault }
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels: { app.kubernetes.io/name: payment }
+      containers:
+        - name: payment
+          image: voltmart/payment:latest
+          imagePullPolicy: IfNotPresent
+          ports: [{ name: http, containerPort: 8080 }]
+          envFrom:
+            - configMapRef: { name: voltmart-config }
+          env:
+            - name: OTEL_SERVICE_NAME
+              value: voltmart-payment
+            - name: TABLE_NAME
+              valueFrom: { configMapKeyRef: { name: voltmart-tables, key: PAYMENTS_TABLE } }
+            - name: K8S_POD_NAME
+              valueFrom: { fieldRef: { fieldPath: metadata.name } }
+            - name: K8S_NAMESPACE
+              valueFrom: { fieldRef: { fieldPath: metadata.namespace } }
+            - name: K8S_NODE_NAME
+              valueFrom: { fieldRef: { fieldPath: spec.nodeName } }
+          resources:
+            requests: { cpu: 50m, memory: 192Mi }
+            limits: { memory: 384Mi }
+          startupProbe:
+            httpGet: { path: /health, port: http }
+            failureThreshold: 20
+            periodSeconds: 3
+          livenessProbe:
+            httpGet: { path: /health, port: http }
+            periodSeconds: 20
+            timeoutSeconds: 3
+          readinessProbe:
+            httpGet: { path: /ready, port: http }
+            periodSeconds: 10
+            timeoutSeconds: 3
+          lifecycle:
+            preStop:
+              exec: { command: ["sleep", "5"] }
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: ["ALL"] }
+          volumeMounts:
+            - { name: tmp, mountPath: /tmp }
+      volumes:
+        - name: tmp
+          emptyDir: { sizeLimit: 64Mi }
+
+# ===========================================================================
+# Checkout — the saga orchestrator. Calls cart, inventory, orders and
+# payment, and compensates in reverse when a step fails. Stateless: the saga
+# lives for the duration of one request.
+# ===========================================================================
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: voltmart-checkout
+  namespace: voltmart
+  labels: { app.kubernetes.io/name: checkout, app.kubernetes.io/part-of: voltmart }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: voltmart-checkout
+  namespace: voltmart
+  labels: { app.kubernetes.io/name: checkout, app.kubernetes.io/part-of: voltmart }
+spec:
+  type: ClusterIP
+  selector: { app.kubernetes.io/name: checkout, app.kubernetes.io/part-of: voltmart }
+  ports: [{ name: http, port: 8080, targetPort: http, protocol: TCP }]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: voltmart-checkout
+  namespace: voltmart
+  labels: { app.kubernetes.io/name: checkout, app.kubernetes.io/part-of: voltmart }
+spec:
+  replicas: 2
+  revisionHistoryLimit: 3
+  selector:
+    matchLabels: { app.kubernetes.io/name: checkout, app.kubernetes.io/part-of: voltmart }
+  strategy:
+    type: RollingUpdate
+    rollingUpdate: { maxSurge: 1, maxUnavailable: 0 }
+  template:
+    metadata:
+      labels: { app.kubernetes.io/name: checkout, app.kubernetes.io/part-of: voltmart }
+    spec:
+      serviceAccountName: voltmart-checkout
+      # Longer than the others: a checkout in flight is holding an inventory
+      # reservation and possibly an authorized payment. Let it finish.
+      terminationGracePeriodSeconds: 60
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        seccompProfile: { type: RuntimeDefault }
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels: { app.kubernetes.io/name: checkout }
+      containers:
+        - name: checkout
+          image: voltmart/checkout:latest
+          imagePullPolicy: IfNotPresent
+          ports: [{ name: http, containerPort: 8080 }]
+          envFrom:
+            - configMapRef: { name: voltmart-config }
+          env:
+            - name: OTEL_SERVICE_NAME
+              value: voltmart-checkout
+            # Holds no state of its own.
+            - name: STORAGE_BACKEND
+              value: memory
+            - name: K8S_POD_NAME
+              valueFrom: { fieldRef: { fieldPath: metadata.name } }
+            - name: K8S_NAMESPACE
+              valueFrom: { fieldRef: { fieldPath: metadata.namespace } }
+            - name: K8S_NODE_NAME
+              valueFrom: { fieldRef: { fieldPath: spec.nodeName } }
+          resources:
+            requests: { cpu: 100m, memory: 192Mi }
+            limits: { memory: 384Mi }
+          startupProbe:
+            httpGet: { path: /health, port: http }
+            failureThreshold: 20
+            periodSeconds: 3
+          livenessProbe:
+            httpGet: { path: /health, port: http }
+            periodSeconds: 20
+            timeoutSeconds: 3
+          readinessProbe:
+            httpGet: { path: /ready, port: http }
+            periodSeconds: 10
+            timeoutSeconds: 3
+          lifecycle:
+            preStop:
+              exec: { command: ["sleep", "10"] }
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: ["ALL"] }
+          volumeMounts:
+            - { name: tmp, mountPath: /tmp }
+      volumes:
+        - name: tmp
+          emptyDir: { sizeLimit: 64Mi }

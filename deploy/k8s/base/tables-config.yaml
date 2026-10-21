@@ -1,0 +1,23 @@
+# DynamoDB table names, one per service that stores state.
+#
+# Table names are stack-scoped (they carry the CloudFormation stack name), so
+# several VoltMart stacks can coexist in one account — useful when a workshop
+# host wants a reference deployment alongside the attendees'. The deploy
+# script overwrites this ConfigMap from the stack outputs; the values here are
+# placeholders that keep `kustomize build` working offline.
+#
+# The catalog service is absent on purpose: its product data is a JSON file
+# baked into the image, so it has no table and needs no AWS permissions.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: voltmart-tables
+  namespace: voltmart
+  labels:
+    app.kubernetes.io/part-of: voltmart
+data:
+  INVENTORY_TABLE: "voltmart-inventory"
+  CART_TABLE: "voltmart-carts"
+  ORDERS_TABLE: "voltmart-orders"
+  PAYMENTS_TABLE: "voltmart-payments"
+  CONVERSATIONS_TABLE: "voltmart-conversations"

@@ -1,0 +1,407 @@
+# The AWS Distro for OpenTelemetry (ADOT) Collector.
+#
+# Every VoltMart service exports OTLP to this one place, and this is the only
+# component that knows about AWS observability services. Swapping backends —
+# to a third-party OTLP endpoint, or adding one alongside X-Ray — is a change
+# to the config below and a pod restart, with no application rebuild.
+#
+# Pipelines:
+#   traces  -> AWS X-Ray                    (the service map and trace detail)
+#   metrics -> CloudWatch EMF + Prometheus  (dashboards and alarms)
+#   logs    -> CloudWatch Logs              (correlated by trace id)
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: voltmart-collector
+  namespace: voltmart
+  labels:
+    app.kubernetes.io/name: collector
+    app.kubernetes.io/part-of: voltmart
+  # No annotation needed for credentials: CloudFormation creates an EKS Pod
+  # Identity Association binding this ServiceAccount to a role that can write
+  # to X-Ray, CloudWatch and Prometheus. The pod gets short-lived credentials
+  # with no access key stored anywhere.
+---
+# The collector enriches spans with pod, node and deployment names, which
+# requires reading those objects. Read-only, and only the object kinds it
+# actually uses.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: voltmart-collector
+  labels:
+    app.kubernetes.io/part-of: voltmart
+rules:
+  - apiGroups: [""]
+    resources: ["pods", "namespaces", "nodes"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["apps"]
+    resources: ["replicasets"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: voltmart-collector
+  labels:
+    app.kubernetes.io/part-of: voltmart
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: voltmart-collector
+subjects:
+  - kind: ServiceAccount
+    name: voltmart-collector
+    namespace: voltmart
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: voltmart-collector-config
+  namespace: voltmart
+  labels:
+    app.kubernetes.io/name: collector
+    app.kubernetes.io/part-of: voltmart
+data:
+  collector.yaml: |
+    receivers:
+      otlp:
+        protocols:
+          grpc:
+            # Binds all interfaces because the pod network is the boundary:
+            # a NetworkPolicy restricts who may reach port 4317, and the
+            # collector is a ClusterIP service with no ingress route.
+            endpoint: 0.0.0.0:4317
+            max_recv_msg_size_mib: 8
+          http:
+            endpoint: 0.0.0.0:4318
+
+    processors:
+      # Must come first in every pipeline. Under memory pressure the collector
+      # starts refusing data rather than being OOM-killed, which keeps a
+      # telemetry spike from taking out the thing that would have shown you
+      # the spike.
+      memory_limiter:
+        check_interval: 1s
+        limit_percentage: 75
+        spike_limit_percentage: 20
+
+      batch/traces:
+        timeout: 5s
+        send_batch_size: 256
+        send_batch_max_size: 512
+
+      batch/metrics:
+        timeout: 30s
+        send_batch_size: 512
+
+      # Fills in cloud.* and k8s.* attributes the application cannot know
+      # about itself.
+      resourcedetection:
+        detectors: [env, eks, ec2]
+        timeout: 5s
+        override: false
+
+      k8sattributes:
+        auth_type: serviceAccount
+        passthrough: false
+        extract:
+          metadata:
+            - k8s.namespace.name
+            - k8s.pod.name
+            - k8s.deployment.name
+            - k8s.node.name
+        pod_association:
+          - sources:
+              - from: resource_attribute
+                name: k8s.pod.name
+          - sources:
+              - from: connection
+
+      # Health and readiness probes fire every few seconds per pod and tell
+      # you nothing. Dropping them here rather than in each service keeps the
+      # X-Ray bill and the trace list focused on real traffic.
+      filter/drop_probes:
+        error_mode: ignore
+        traces:
+          span:
+            - 'attributes["http.route"] == "/health"'
+            - 'attributes["http.route"] == "/ready"'
+            - 'attributes["url.path"] == "/health"'
+            - 'attributes["url.path"] == "/ready"'
+
+    exporters:
+      # ---- Traces ---------------------------------------------------------
+      awsxray:
+        region: ${AWS_REGION}
+        indexed_attributes:
+          # Indexed attributes are filterable in the X-Ray console, which is
+          # what makes "show me every failed checkout" a one-click query.
+          - voltmart.order.id
+          - voltmart.checkout.outcome
+          - voltmart.checkout.failed_step
+          - voltmart.payment.decline_reason
+          - voltmart.agent.tool
+          - voltmart.error.code
+        telemetry:
+          enabled: true
+
+      # ---- Metrics --------------------------------------------------------
+      awsemf:
+        region: ${AWS_REGION}
+        namespace: VoltMart
+        log_group_name: /aws/voltmart/metrics
+        log_stream_name: otel-collector
+        dimension_rollup_option: NoDimensionRollup
+        resource_to_telemetry_conversion:
+          enabled: true
+        metric_declarations:
+          - dimensions: [[service.name], [service.name, outcome]]
+            metric_name_selectors:
+              - "voltmart\\.checkout\\..*"
+              - "voltmart\\.payments\\..*"
+              - "voltmart\\.orders\\..*"
+          - dimensions: [[service.name], [service.name, tool]]
+            metric_name_selectors:
+              - "voltmart\\.agent\\..*"
+          - dimensions: [[service.name]]
+            metric_name_selectors:
+              - "voltmart\\..*"
+              - "http\\.server\\..*"
+
+      prometheusremotewrite:
+        endpoint: ${AMP_REMOTE_WRITE_URL}
+        auth:
+          authenticator: sigv4auth
+        resource_to_telemetry_conversion:
+          enabled: true
+        retry_on_failure:
+          enabled: true
+          initial_interval: 5s
+          max_interval: 30s
+
+      # ---- Logs -----------------------------------------------------------
+      awscloudwatchlogs:
+        region: ${AWS_REGION}
+        log_group_name: /aws/voltmart/application
+        log_stream_name: otel-collector
+        raw_log: false
+
+      # Prints a one-line summary per batch. Invaluable for the first five
+      # minutes of a workshop ("is anything arriving at all?") and cheap
+      # enough to leave on.
+      debug:
+        verbosity: basic
+        sampling_initial: 2
+        sampling_thereafter: 500
+
+    extensions:
+      # Signs the Prometheus remote-write requests with the pod's role
+      # credentials. No static credentials anywhere in this config.
+      sigv4auth:
+        region: ${AWS_REGION}
+        service: aps
+
+      health_check:
+        endpoint: 0.0.0.0:13133
+
+      # Exposes the collector's own queue depths and drop counts.
+      pprof:
+        endpoint: localhost:1777
+
+    service:
+      extensions: [sigv4auth, health_check, pprof]
+      telemetry:
+        logs:
+          level: info
+          encoding: json
+        metrics:
+          level: basic
+          address: 0.0.0.0:8888
+      pipelines:
+        traces:
+          receivers: [otlp]
+          processors:
+            - memory_limiter
+            - filter/drop_probes
+            - k8sattributes
+            - resourcedetection
+            - batch/traces
+          exporters: [awsxray, debug]
+
+        metrics:
+          receivers: [otlp]
+          processors:
+            - memory_limiter
+            - k8sattributes
+            - resourcedetection
+            - batch/metrics
+          exporters: [awsemf, prometheusremotewrite, debug]
+
+        logs:
+          receivers: [otlp]
+          processors:
+            - memory_limiter
+            - k8sattributes
+            - resourcedetection
+            - batch/traces
+          exporters: [awscloudwatchlogs]
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: voltmart-collector
+  namespace: voltmart
+  labels:
+    app.kubernetes.io/name: collector
+    app.kubernetes.io/part-of: voltmart
+spec:
+  # ClusterIP: the collector is reachable only from inside the cluster. An
+  # OTLP endpoint published to the internet is an open ingestion funnel into
+  # your observability bill.
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: collector
+    app.kubernetes.io/part-of: voltmart
+  ports:
+    - name: otlp-grpc
+      port: 4317
+      targetPort: 4317
+      protocol: TCP
+    - name: otlp-http
+      port: 4318
+      targetPort: 4318
+      protocol: TCP
+    - name: metrics
+      port: 8888
+      targetPort: 8888
+      protocol: TCP
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: voltmart-collector
+  namespace: voltmart
+  labels:
+    app.kubernetes.io/name: collector
+    app.kubernetes.io/part-of: voltmart
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: collector
+      app.kubernetes.io/part-of: voltmart
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: collector
+        app.kubernetes.io/part-of: voltmart
+      annotations:
+        # Roll the pods when the config changes. Without this a ConfigMap edit
+        # is silently ignored until something else triggers a restart.
+        checksum/config: "replaced-at-deploy-time"
+    spec:
+      serviceAccountName: voltmart-collector
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      # Spread the two replicas across nodes so losing one node does not take
+      # all telemetry with it.
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: collector
+      containers:
+        - name: collector
+          # Pinned deliberately. With `latest`, two replicas can end up running
+          # different builds after a node replacement, and a workshop run six
+          # months from now would not match the one you rehearsed.
+          image: public.ecr.aws/aws-observability/aws-otel-collector:v0.50.0
+          imagePullPolicy: IfNotPresent
+          args: ["--config=/conf/collector.yaml"]
+          ports:
+            - name: otlp-grpc
+              containerPort: 4317
+            - name: otlp-http
+              containerPort: 4318
+            - name: metrics
+              containerPort: 8888
+            - name: health
+              containerPort: 13133
+          env:
+            - name: AWS_REGION
+              valueFrom:
+                configMapKeyRef:
+                  name: voltmart-config
+                  key: AWS_REGION
+            - name: AMP_REMOTE_WRITE_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: voltmart-observability
+                  key: AMP_REMOTE_WRITE_URL
+            # Caps the collector's own heap below the container limit so
+            # memory_limiter engages before the kernel does.
+            - name: GOMEMLIMIT
+              value: "400MiB"
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              # No CPU limit on purpose: throttling the collector during a
+              # traffic spike loses exactly the telemetry you need most.
+              memory: 512Mi
+          livenessProbe:
+            httpGet:
+              path: /
+              port: health
+            initialDelaySeconds: 15
+            periodSeconds: 20
+            timeoutSeconds: 5
+          readinessProbe:
+            httpGet:
+              path: /
+              port: health
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: config
+              mountPath: /conf
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: config
+          configMap:
+            name: voltmart-collector-config
+        - name: tmp
+          emptyDir:
+            sizeLimit: 128Mi
+---
+# Keep at least one collector up during voluntary disruptions such as a node
+# drain, so a cluster upgrade does not create a telemetry gap.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: voltmart-collector
+  namespace: voltmart
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: collector
+      app.kubernetes.io/part-of: voltmart

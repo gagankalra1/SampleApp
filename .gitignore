@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Node
+node_modules/
+frontend/dist/
+frontend/.vite/
+*.tsbuildinfo
+
+# Local env / secrets
+.env
+.env.local
+*.pem
+*.key
+
+# Build + deploy artifacts
+.build/
+dist-assets/
+packaged-*.yaml
+kubeconfig*
+*.log
+
+# Editors / OS
+.DS_Store
+.idea/
+.vscode/

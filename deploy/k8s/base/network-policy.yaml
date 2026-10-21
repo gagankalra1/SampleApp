@@ -1,0 +1,246 @@
+# Who may talk to whom.
+#
+# The default is deny. Every allowed flow below corresponds to a call that
+# actually exists in the code, which means the policy doubles as an accurate
+# diagram of the system's dependencies — and a wrong one fails loudly rather
+# than silently permitting too much.
+#
+# The payload of this file is one property: *nothing but the checkout service
+# can reach the payment service.* Even if someone later adds a proxy route for
+# it by mistake, the network refuses the connection.
+#
+# Requires NetworkPolicy enforcement in the CNI. The CloudFormation stack
+# enables it on the VPC CNI add-on (`enableNetworkPolicy: "true"`). Without
+# that the policies are accepted by the API server and quietly do nothing, so
+# verify with: kubectl get ds aws-node -n kube-system -o yaml | grep -i network-policy
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-ingress
+  namespace: voltmart
+spec:
+  # Empty selector = every pod in the namespace.
+  podSelector: {}
+  policyTypes: [Ingress]
+---
+# DNS, for everyone. Without this nothing can resolve a service name and the
+# whole namespace breaks in a way that looks like a code bug.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-dns-egress
+  namespace: voltmart
+spec:
+  podSelector: {}
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+      ports:
+        - { protocol: UDP, port: 53 }
+        - { protocol: TCP, port: 53 }
+---
+# Every service may reach the collector. Telemetry should never be the thing
+# a policy change breaks.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-collector-ingress
+  namespace: voltmart
+spec:
+  podSelector:
+    matchLabels: { app.kubernetes.io/name: collector }
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels: { app.kubernetes.io/part-of: voltmart }
+      ports:
+        - { protocol: TCP, port: 4317 }
+        - { protocol: TCP, port: 4318 }
+        - { protocol: TCP, port: 8888 }
+---
+# The frontend accepts traffic from the load balancer. With target-type: ip
+# the ALB connects straight to the pod from outside the cluster, so this rule
+# cannot be expressed as a pod selector.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-frontend-ingress
+  namespace: voltmart
+spec:
+  podSelector:
+    matchLabels: { app.kubernetes.io/name: frontend }
+  policyTypes: [Ingress]
+  ingress:
+    - ports:
+        - { protocol: TCP, port: 8080 }
+---
+# Catalog is read by the frontend proxy and by cart, orders and the agent.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-catalog-ingress
+  namespace: voltmart
+spec:
+  podSelector:
+    matchLabels: { app.kubernetes.io/name: catalog }
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector: { matchLabels: { app.kubernetes.io/name: frontend } }
+        - podSelector: { matchLabels: { app.kubernetes.io/name: cart } }
+        - podSelector: { matchLabels: { app.kubernetes.io/name: orders } }
+        - podSelector: { matchLabels: { app.kubernetes.io/name: support-agent } }
+      ports:
+        - { protocol: TCP, port: 8080 }
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-inventory-ingress
+  namespace: voltmart
+spec:
+  podSelector:
+    matchLabels: { app.kubernetes.io/name: inventory }
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector: { matchLabels: { app.kubernetes.io/name: frontend } }
+        - podSelector: { matchLabels: { app.kubernetes.io/name: cart } }
+        - podSelector: { matchLabels: { app.kubernetes.io/name: checkout } }
+        - podSelector: { matchLabels: { app.kubernetes.io/name: orders } }
+        - podSelector: { matchLabels: { app.kubernetes.io/name: support-agent } }
+      ports:
+        - { protocol: TCP, port: 8080 }
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-cart-ingress
+  namespace: voltmart
+spec:
+  podSelector:
+    matchLabels: { app.kubernetes.io/name: cart }
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector: { matchLabels: { app.kubernetes.io/name: frontend } }
+        - podSelector: { matchLabels: { app.kubernetes.io/name: checkout } }
+        - podSelector: { matchLabels: { app.kubernetes.io/name: support-agent } }
+      ports:
+        - { protocol: TCP, port: 8080 }
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-orders-ingress
+  namespace: voltmart
+spec:
+  podSelector:
+    matchLabels: { app.kubernetes.io/name: orders }
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector: { matchLabels: { app.kubernetes.io/name: frontend } }
+        - podSelector: { matchLabels: { app.kubernetes.io/name: checkout } }
+        - podSelector: { matchLabels: { app.kubernetes.io/name: support-agent } }
+      ports:
+        - { protocol: TCP, port: 8080 }
+---
+# The important one. Only checkout and the support agent may reach payment —
+# checkout to authorize, the agent to read status and issue refunds. The
+# frontend is deliberately absent, so a browser cannot reach the payment
+# service even if a proxy route were added by mistake.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-payment-ingress
+  namespace: voltmart
+spec:
+  podSelector:
+    matchLabels: { app.kubernetes.io/name: payment }
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector: { matchLabels: { app.kubernetes.io/name: checkout } }
+        - podSelector: { matchLabels: { app.kubernetes.io/name: support-agent } }
+      ports:
+        - { protocol: TCP, port: 8080 }
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-checkout-ingress
+  namespace: voltmart
+spec:
+  podSelector:
+    matchLabels: { app.kubernetes.io/name: checkout }
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector: { matchLabels: { app.kubernetes.io/name: frontend } }
+        - podSelector: { matchLabels: { app.kubernetes.io/name: support-agent } }
+      ports:
+        - { protocol: TCP, port: 8080 }
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-support-agent-ingress
+  namespace: voltmart
+spec:
+  podSelector:
+    matchLabels: { app.kubernetes.io/name: support-agent }
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector: { matchLabels: { app.kubernetes.io/name: frontend } }
+      ports:
+        - { protocol: TCP, port: 8080 }
+---
+# Egress to AWS APIs — DynamoDB, Bedrock, X-Ray, CloudWatch, Prometheus —
+# plus the in-namespace service calls.
+#
+# This is permissive by design: restricting egress to AWS service IP ranges
+# means maintaining prefix lists, and getting it wrong produces failures that
+# look like application bugs. In a workshop the clearer tradeoff is to allow
+# outbound and rely on IAM to decide what the credentials can actually do.
+# Narrow this with VPC endpoints and a prefix-list-scoped policy for a
+# longer-lived deployment.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-service-egress
+  namespace: voltmart
+spec:
+  podSelector:
+    matchLabels: { app.kubernetes.io/part-of: voltmart }
+  policyTypes: [Egress]
+  egress:
+    # Sibling services and the collector.
+    - to:
+        - podSelector:
+            matchLabels: { app.kubernetes.io/part-of: voltmart }
+    # Cluster DNS.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+      ports:
+        - { protocol: UDP, port: 53 }
+        - { protocol: TCP, port: 53 }
+    # HTTPS to AWS service endpoints.
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              # Block the instance metadata service. Pods get credentials from
+              # Pod Identity; reaching IMDS would let a compromised pod borrow
+              # the node role, which is far more powerful.
+              - 169.254.169.254/32
+      ports:
+        - { protocol: TCP, port: 443 }

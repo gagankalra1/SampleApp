@@ -1,0 +1,94 @@
+# The single public entry point.
+#
+# An internet-facing Application Load Balancer, created by the AWS Load
+# Balancer Controller, forwarding to the frontend pods. The frontend's nginx
+# then proxies an allowlist of /api paths to the internal services.
+#
+# ---------------------------------------------------------------------------
+# What is exposed, and the decision behind it
+# ---------------------------------------------------------------------------
+# Public and unauthenticated:
+#   * the storefront, product catalog, stock levels — public content, the same
+#     as any real store's product pages
+#   * cart and order operations — these act on a random browser-generated id
+#     over entirely fabricated data
+#   * the support agent — and this one costs money per call
+#
+# The agent endpoint is the part worth thinking about: every request invokes a
+# foundation model. Three things limit the damage in a workshop account:
+#
+#   1. nginx rate limits /api/support to 2 requests/second per client IP.
+#   2. The service applies its own per-identity sliding window and caps
+#      concurrent model calls with a bounded thread pool.
+#   3. `AllowedIngressCidr` on the stack restricts who can reach the load
+#      balancer at all.
+#
+# For a workshop, set AllowedIngressCidr to your venue or corporate range.
+# The 0.0.0.0/0 default exists so the first deploy works from anywhere, and
+# it is the first thing to change if the stack will live longer than a day.
+#
+# Beyond a workshop this needs real authentication, which the ALB can do
+# without any application change: `alb.ingress.kubernetes.io/auth-type: oidc`
+# with a Cognito user pool. See docs/SECURITY.md.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: voltmart
+  namespace: voltmart
+  labels:
+    app.kubernetes.io/name: voltmart
+    app.kubernetes.io/part-of: voltmart
+  annotations:
+    alb.ingress.kubernetes.io/scheme: internet-facing
+    alb.ingress.kubernetes.io/target-type: ip
+    alb.ingress.kubernetes.io/load-balancer-name: voltmart
+    alb.ingress.kubernetes.io/listen-ports: '[{"HTTP": 80}]'
+
+    # Restricts the load balancer's security group. Patched by the deploy
+    # script from the AllowedIngressCidr stack parameter.
+    alb.ingress.kubernetes.io/inbound-cidrs: 0.0.0.0/0
+
+    alb.ingress.kubernetes.io/healthcheck-path: /healthz
+    alb.ingress.kubernetes.io/healthcheck-interval-seconds: "15"
+    alb.ingress.kubernetes.io/healthcheck-timeout-seconds: "5"
+    alb.ingress.kubernetes.io/healthy-threshold-count: "2"
+    alb.ingress.kubernetes.io/unhealthy-threshold-count: "3"
+    alb.ingress.kubernetes.io/success-codes: "200"
+
+    # Long enough for an agent turn that chains several tool calls.
+    alb.ingress.kubernetes.io/load-balancer-attributes: idle_timeout.timeout_seconds=180
+
+    # Drop malformed requests at the edge instead of forwarding them.
+    alb.ingress.kubernetes.io/target-group-attributes: >-
+      deregistration_delay.timeout_seconds=15,
+      load_balancing.algorithm.type=least_outstanding_requests
+
+    alb.ingress.kubernetes.io/tags: Project=voltmart,Environment=workshop
+
+    # ---- To serve HTTPS (recommended for anything beyond a few hours) ----
+    # Provide a certificate and the stack will redirect HTTP to HTTPS:
+    #
+    #   alb.ingress.kubernetes.io/certificate-arn: arn:aws:acm:...
+    #   alb.ingress.kubernetes.io/listen-ports: '[{"HTTP": 80}, {"HTTPS": 443}]'
+    #   alb.ingress.kubernetes.io/ssl-redirect: "443"
+    #   alb.ingress.kubernetes.io/ssl-policy: ELBSecurityPolicy-TLS13-1-2-2021-06
+    #
+    # Left out of the default because issuing a certificate needs a domain the
+    # workshop account does not necessarily have. Over plain HTTP the card
+    # fields on the checkout page are sent in the clear — acceptable only
+    # because the card numbers are published fakes.
+spec:
+  ingressClassName: alb
+  rules:
+    - http:
+        paths:
+          # One rule. nginx inside the pod does the path routing, which keeps
+          # the ALB configuration trivial and means adding a service does not
+          # mean touching the load balancer.
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: voltmart-frontend
+                port:
+                  number: 80

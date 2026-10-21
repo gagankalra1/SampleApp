@@ -1,0 +1,17 @@
+# Values that only exist once the AWS infrastructure has been created.
+#
+# The deploy script overwrites this ConfigMap with the real CloudFormation
+# outputs before applying the workloads. The placeholders below keep
+# `kustomize build` valid on its own, so the manifests can be linted and
+# diffed without an AWS account.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: voltmart-observability
+  namespace: voltmart
+  labels:
+    app.kubernetes.io/part-of: voltmart
+data:
+  # Amazon Managed Service for Prometheus remote-write endpoint, from the
+  # PrometheusRemoteWriteUrl stack output.
+  AMP_REMOTE_WRITE_URL: "https://aps-workspaces.us-west-2.amazonaws.com/workspaces/ws-PLACEHOLDER/api/v1/remote_write"

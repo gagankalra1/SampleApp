@@ -1,0 +1,325 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  VoltMart EKS cluster: control plane, a managed node group in private
+  subnets, and the add-ons the application depends on.
+
+# Two choices here are worth explaining, because both avoid a class of
+# problem that bites workshop templates specifically.
+#
+# 1. Kubernetes and add-on versions are left unset by default.
+#    EKS then picks its current default. A template that pins 1.31 works
+#    today and fails in eighteen months when that version leaves support,
+#    which is exactly when someone dusts off the workshop to run it again.
+#    Pin explicitly via the KubernetesVersion parameter when you need a run
+#    to be byte-for-byte reproducible.
+#
+# 2. Authentication uses EKS access entries, not the aws-auth ConfigMap.
+#    The old pattern needs something to log into the cluster and edit a
+#    ConfigMap before anything else can work, which means a custom resource
+#    doing kubectl calls during stack creation — a notorious source of
+#    half-created stacks. Access entries are plain CloudFormation resources.
+
+Parameters:
+  ClusterName:
+    Type: String
+    Description: Name for the EKS cluster.
+
+  KubernetesVersion:
+    Type: String
+    Default: ''
+    Description: >-
+      Kubernetes minor version, e.g. 1.34. Leave blank to use the EKS default,
+      which is the recommended choice unless you need an exact version.
+
+  PrivateSubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: Private subnets for the worker nodes.
+
+  PublicSubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: Public subnets, so EKS can place the load balancer.
+
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+
+  NodeInstanceType:
+    Type: String
+    Default: t3.large
+    Description: >-
+      Worker instance type. t3.large (2 vCPU, 8 GiB) comfortably runs the
+      whole stack; the full application requests roughly 4 GiB in total.
+
+  DesiredNodeCount:
+    Type: Number
+    Default: 3
+    MinValue: 2
+    MaxValue: 10
+    Description: >-
+      Node count. Two is enough to run everything; three leaves room for a
+      rolling update and keeps pods spread while a node is replaced.
+
+  MaxNodeCount:
+    Type: Number
+    Default: 6
+    MinValue: 2
+    MaxValue: 20
+
+  NodeDiskSize:
+    Type: Number
+    Default: 50
+    MinValue: 20
+    Description: Root volume size in GiB. Eight container images need real room.
+
+  AdminPrincipalArn:
+    Type: String
+    Default: ''
+    Description: >-
+      Optional IAM role or user ARN to grant cluster-admin. Set this to your
+      own role so you can run kubectl after the stack finishes; without it,
+      only the stack's deployer role can reach the cluster.
+
+  DeployerRoleArn:
+    Type: String
+    Description: The CodeBuild deployer role, which needs admin to apply manifests.
+
+Conditions:
+  UseDefaultKubernetesVersion: !Equals [!Ref KubernetesVersion, '']
+  HasAdminPrincipal: !Not [!Equals [!Ref AdminPrincipalArn, '']]
+
+Resources:
+  # =========================================================================
+  # Control plane
+  # =========================================================================
+  ClusterRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: eks.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonEKSClusterPolicy
+      Tags:
+        - { Key: Project, Value: voltmart }
+
+  ClusterSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: VoltMart EKS control plane security group
+      VpcId: !Ref VpcId
+      # No ingress rules. EKS adds what it needs between the control plane and
+      # the nodes; nothing else should be reaching the API server inside the
+      # VPC.
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+          Description: Allow all outbound
+      Tags:
+        - { Key: Name, Value: !Sub '${ClusterName}-control-plane' }
+
+  Cluster:
+    Type: AWS::EKS::Cluster
+    Properties:
+      Name: !Ref ClusterName
+      Version: !If [UseDefaultKubernetesVersion, !Ref 'AWS::NoValue', !Ref KubernetesVersion]
+      RoleArn: !GetAtt ClusterRole.Arn
+      AccessConfig:
+        # API_AND_CONFIG_MAP rather than API only: some tooling still writes
+        # to aws-auth, and leaving that path open avoids locking anyone out
+        # of their own workshop cluster.
+        AuthenticationMode: API_AND_CONFIG_MAP
+        BootstrapClusterCreatorAdminPermissions: true
+      ResourcesVpcConfig:
+        # Both private and public subnets. The control plane places its
+        # cross-account ENIs in the private ones; the public ones are what let
+        # EKS and the load balancer controller create an internet-facing ALB.
+        # Listed explicitly rather than concatenated: the network stack always
+        # creates exactly two of each, and spelling them out is far easier to
+        # read than nested Join/Split gymnastics.
+        SubnetIds:
+          - !Select [0, !Ref PrivateSubnetIds]
+          - !Select [1, !Ref PrivateSubnetIds]
+          - !Select [0, !Ref PublicSubnetIds]
+          - !Select [1, !Ref PublicSubnetIds]
+        SecurityGroupIds:
+          - !Ref ClusterSecurityGroup
+        # Public endpoint access is on so that kubectl works from a laptop or
+        # a Cloud9/CloudShell session without a bastion — which a workshop
+        # needs. Private access is also on so in-cluster traffic to the API
+        # server stays inside the VPC.
+        #
+        # Restrict PublicAccessCidrs below to your own range for anything
+        # long-lived. The endpoint still requires IAM authentication, so an
+        # open endpoint is not an open cluster, but narrowing it removes the
+        # ability to even attempt authentication.
+        EndpointPublicAccess: true
+        EndpointPrivateAccess: true
+      Logging:
+        ClusterLogging:
+          EnabledTypes:
+            # The audit log is the one that answers "who deleted that", and
+            # the authenticator log explains access-denied errors. Both are
+            # worth the CloudWatch ingestion cost.
+            - { Type: api }
+            - { Type: audit }
+            - { Type: authenticator }
+            - { Type: controllerManager }
+            - { Type: scheduler }
+      Tags:
+        - { Key: Project, Value: voltmart }
+
+  # =========================================================================
+  # Access entries
+  # =========================================================================
+  # The deployer builds images and applies manifests, which needs broad
+  # cluster permission. It is a build-time identity that nothing else can
+  # assume, and it disappears with the stack.
+  DeployerAccessEntry:
+    Type: AWS::EKS::AccessEntry
+    Properties:
+      ClusterName: !Ref Cluster
+      PrincipalArn: !Ref DeployerRoleArn
+      Type: STANDARD
+      AccessPolicies:
+        - PolicyArn: arn:aws:eks::aws:cluster-access-policy/AmazonEKSClusterAdminPolicy
+          AccessScope:
+            Type: cluster
+
+  AdminAccessEntry:
+    Type: AWS::EKS::AccessEntry
+    Condition: HasAdminPrincipal
+    Properties:
+      ClusterName: !Ref Cluster
+      PrincipalArn: !Ref AdminPrincipalArn
+      Type: STANDARD
+      AccessPolicies:
+        - PolicyArn: arn:aws:eks::aws:cluster-access-policy/AmazonEKSClusterAdminPolicy
+          AccessScope:
+            Type: cluster
+
+  # =========================================================================
+  # Worker nodes
+  # =========================================================================
+  NodeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ec2.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonEKSWorkerNodePolicy
+        - arn:aws:iam::aws:policy/AmazonEKS_CNI_Policy
+        - arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly
+        # SSM access for troubleshooting a node without opening SSH. There is
+        # no key pair and no port 22 anywhere in this stack.
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      # Deliberately absent: DynamoDB, Bedrock, X-Ray, CloudWatch write. The
+      # node role is not where application permissions belong — pods get
+      # their own roles through Pod Identity, so one compromised pod cannot
+      # borrow the node's credentials to reach everything else.
+      Tags:
+        - { Key: Project, Value: voltmart }
+
+  NodeGroup:
+    Type: AWS::EKS::Nodegroup
+    # Ordering against the cluster is already implied by the !Ref below, so no
+    # explicit DependsOn is needed.
+    Properties:
+      ClusterName: !Ref Cluster
+      NodegroupName: !Sub '${ClusterName}-nodes'
+      NodeRole: !GetAtt NodeRole.Arn
+      # Private subnets only. Nodes get no public IP.
+      Subnets: !Ref PrivateSubnetIds
+      InstanceTypes: [!Ref NodeInstanceType]
+      AmiType: AL2023_x86_64_STANDARD
+      CapacityType: ON_DEMAND
+      DiskSize: !Ref NodeDiskSize
+      ScalingConfig:
+        MinSize: 2
+        DesiredSize: !Ref DesiredNodeCount
+        MaxSize: !Ref MaxNodeCount
+      UpdateConfig:
+        MaxUnavailable: 1
+      Labels:
+        workload: voltmart
+      Tags:
+        Project: voltmart
+
+  # =========================================================================
+  # Add-ons
+  # =========================================================================
+  # AddonVersion is omitted throughout so EKS installs the default build for
+  # whichever cluster version is running. Pinning add-on versions means
+  # pinning them to a cluster version, and the two drift apart.
+
+  # Pod Identity must come first: it is how every other pod gets AWS
+  # credentials, including the collector.
+  PodIdentityAddon:
+    Type: AWS::EKS::Addon
+    DependsOn: [NodeGroup]
+    Properties:
+      ClusterName: !Ref Cluster
+      AddonName: eks-pod-identity-agent
+      ResolveConflicts: OVERWRITE
+
+  VpcCniAddon:
+    Type: AWS::EKS::Addon
+    DependsOn: [NodeGroup]
+    Properties:
+      ClusterName: !Ref Cluster
+      AddonName: vpc-cni
+      ResolveConflicts: OVERWRITE
+      ConfigurationValues: |
+        {
+          "enableNetworkPolicy": "true",
+          "env": {
+            "ENABLE_PREFIX_DELEGATION": "true",
+            "WARM_PREFIX_TARGET": "1"
+          }
+        }
+      # enableNetworkPolicy is what makes deploy/k8s/base/network-policy.yaml
+      # actually enforce anything. Without it the policies are accepted by the
+      # API server and silently ignored, which is worse than having none.
+      #
+      # Prefix delegation raises the pod-per-node ceiling considerably, so a
+      # t3.large can host the whole stack instead of running out of ENI slots.
+
+  CoreDnsAddon:
+    Type: AWS::EKS::Addon
+    # CoreDNS pods cannot schedule until nodes exist, and the VPC CNI must be
+    # configured before they get addresses.
+    DependsOn: [NodeGroup, VpcCniAddon]
+    Properties:
+      ClusterName: !Ref Cluster
+      AddonName: coredns
+      ResolveConflicts: OVERWRITE
+
+  KubeProxyAddon:
+    Type: AWS::EKS::Addon
+    DependsOn: [NodeGroup]
+    Properties:
+      ClusterName: !Ref Cluster
+      AddonName: kube-proxy
+      ResolveConflicts: OVERWRITE
+
+Outputs:
+  ClusterName:
+    Value: !Ref Cluster
+  ClusterArn:
+    Value: !GetAtt Cluster.Arn
+  ClusterEndpoint:
+    Value: !GetAtt Cluster.Endpoint
+  ClusterOidcIssuer:
+    Value: !GetAtt Cluster.OpenIdConnectIssuerUrl
+  NodeRoleArn:
+    Value: !GetAtt NodeRole.Arn
+  NodeGroupName:
+    Value: !Ref NodeGroup
+  ClusterSecurityGroupId:
+    Description: The security group EKS manages for control-plane-to-node traffic.
+    Value: !GetAtt Cluster.ClusterSecurityGroupId

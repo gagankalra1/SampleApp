@@ -1,0 +1,67 @@
+# Settings shared by every VoltMart service.
+#
+# Nothing in here is a secret. Service-to-service URLs, table names, the
+# collector endpoint and feature flags are all plain configuration; the stack
+# has no passwords or API keys to manage because the pods authenticate to AWS
+# with EKS Pod Identity and short-lived role credentials.
+#
+# The deploy script patches the AWS-specific values (region, cluster name,
+# table names) at apply time from the CloudFormation outputs.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: voltmart-config
+  namespace: voltmart
+  labels:
+    app.kubernetes.io/part-of: voltmart
+data:
+  # ---- Telemetry ---------------------------------------------------------
+  # The ADOT Collector in this namespace. Every service exports OTLP/gRPC here
+  # and the collector decides where it goes next, so changing observability
+  # backends is a collector change and not a rebuild of seven images.
+  OTEL_EXPORTER_OTLP_ENDPOINT: "http://voltmart-collector:4317"
+  OTEL_EXPORTER_OTLP_INSECURE: "true"
+  OTEL_SERVICE_NAMESPACE: "voltmart"
+  DEPLOYMENT_ENVIRONMENT: "workshop"
+  OTEL_METRIC_EXPORT_INTERVAL: "30000"
+  OTEL_PYTHON_LOG_CORRELATION: "true"
+  OTEL_AWS_XRAY_ID_GENERATOR: "true"
+
+  # ---- Runtime -----------------------------------------------------------
+  LOG_LEVEL: "info"
+  STORAGE_BACKEND: "dynamodb"
+  BIND_HOST: "0.0.0.0"
+  PORT: "8080"
+  AWS_REGION: "us-west-2"
+  K8S_CLUSTER_NAME: "voltmart"
+
+  # ---- Service discovery -------------------------------------------------
+  # Short names resolve within the namespace via cluster DNS.
+  CATALOG_URL: "http://voltmart-catalog:8080"
+  INVENTORY_URL: "http://voltmart-inventory:8080"
+  CART_URL: "http://voltmart-cart:8080"
+  ORDERS_URL: "http://voltmart-orders:8080"
+  PAYMENT_URL: "http://voltmart-payment:8080"
+  CHECKOUT_URL: "http://voltmart-checkout:8080"
+  DOWNSTREAM_TIMEOUT_SECONDS: "8"
+
+  # ---- Business knobs the workshop can turn ------------------------------
+  LOW_STOCK_THRESHOLD: "10"
+  # Fraction of payments that fail with a simulated processor fault. Raise to
+  # 0.2 to generate a visible error rate in the dashboards.
+  PAYMENT_CHAOS_FAILURE_RATE: "0"
+  PAYMENT_REVIEW_THRESHOLD: "8000"
+
+  # ---- Support agent -----------------------------------------------------
+  # Replaced by the deploy script with the BedrockModelId stack parameter.
+  # Model ids are retired over time; if the agent reports itself unavailable,
+  # check GET /agent/diagnostics and compare against
+  # `aws bedrock list-inference-profiles`.
+  BEDROCK_MODEL_ID: "us.anthropic.claude-sonnet-4-5-20250929-v1:0"
+  BEDROCK_TEMPERATURE: "0.3"
+  BEDROCK_MAX_TOKENS: "2048"
+  AGENT_RATE_LIMIT_REQUESTS: "20"
+  AGENT_RATE_LIMIT_WINDOW: "60"
+  AGENT_MAX_CONCURRENT_TURNS: "8"
+  AGENT_MAX_HISTORY_TURNS: "20"
+  AGENT_CONVERSATION_TTL: "86400"

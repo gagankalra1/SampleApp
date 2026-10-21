@@ -1,0 +1,200 @@
+# VoltMart on one machine.
+#
+#   docker compose up --build
+#
+#   storefront   http://localhost:8080
+#   traces       http://localhost:16686   (Jaeger)
+#
+# Differences from the EKS deployment, and why they are acceptable:
+#
+#   Storage is in-memory. No DynamoDB, no credentials, no AWS account. State
+#   resets when a container restarts, and each service runs a single replica
+#   because an in-memory store is not shared. That is the point: the whole
+#   application runs with `docker compose up` and nothing else.
+#
+#   Traces go to Jaeger instead of the ADOT Collector. Same OTLP protocol,
+#   same instrumentation, same spans — the application cannot tell the
+#   difference. Jaeger gives you a trace viewer locally without an AWS
+#   backend, which makes it a better teaching tool for the first hour.
+#
+#   The support agent still calls Amazon Bedrock, because there is no local
+#   substitute for a foundation model. Mount your AWS credentials (see below)
+#   or leave it out — everything except the chat widget works without it.
+
+name: voltmart
+
+x-service-defaults: &service-defaults
+  build:
+    context: ./services
+    dockerfile: Dockerfile
+  restart: unless-stopped
+  environment: &service-env
+    BIND_HOST: 0.0.0.0
+    PORT: "8080"
+    LOG_LEVEL: info
+    STORAGE_BACKEND: memory
+    # Jaeger's OTLP gRPC receiver. Identical configuration to the collector in
+    # the cluster, just a different hostname.
+    OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4317
+    OTEL_EXPORTER_OTLP_INSECURE: "true"
+    OTEL_SERVICE_NAMESPACE: voltmart
+    DEPLOYMENT_ENVIRONMENT: local
+    # Jaeger expects standard W3C trace ids, not the X-Ray format.
+    OTEL_AWS_XRAY_ID_GENERATOR: "false"
+    CATALOG_URL: http://catalog:8080
+    INVENTORY_URL: http://inventory:8080
+    CART_URL: http://cart:8080
+    ORDERS_URL: http://orders:8080
+    PAYMENT_URL: http://payment:8080
+    CHECKOUT_URL: http://checkout:8080
+  healthcheck:
+    test: ["CMD", "curl", "--fail", "--silent", "http://127.0.0.1:8080/health"]
+    interval: 10s
+    timeout: 3s
+    retries: 5
+    start_period: 20s
+
+services:
+  # ---- Telemetry ---------------------------------------------------------
+  jaeger:
+    image: jaegertracing/all-in-one:1.62.0
+    restart: unless-stopped
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
+    ports:
+      # Trace UI. Open a checkout, then look at the voltmart-checkout service.
+      - "127.0.0.1:16686:16686"
+    expose:
+      - "4317"
+      - "4318"
+
+  # ---- Business services -------------------------------------------------
+  catalog:
+    <<: *service-defaults
+    build:
+      context: ./services
+      dockerfile: Dockerfile
+      args: { SERVICE: catalog }
+    environment:
+      <<: *service-env
+      OTEL_SERVICE_NAME: voltmart-catalog
+    depends_on: [jaeger]
+
+  inventory:
+    <<: *service-defaults
+    build:
+      context: ./services
+      dockerfile: Dockerfile
+      args: { SERVICE: inventory }
+    environment:
+      <<: *service-env
+      OTEL_SERVICE_NAME: voltmart-inventory
+    depends_on: [jaeger]
+
+  cart:
+    <<: *service-defaults
+    build:
+      context: ./services
+      dockerfile: Dockerfile
+      args: { SERVICE: cart }
+    environment:
+      <<: *service-env
+      OTEL_SERVICE_NAME: voltmart-cart
+    depends_on:
+      catalog: { condition: service_healthy }
+
+  orders:
+    <<: *service-defaults
+    build:
+      context: ./services
+      dockerfile: Dockerfile
+      args: { SERVICE: orders }
+    environment:
+      <<: *service-env
+      OTEL_SERVICE_NAME: voltmart-orders
+    depends_on:
+      catalog: { condition: service_healthy }
+
+  payment:
+    <<: *service-defaults
+    build:
+      context: ./services
+      dockerfile: Dockerfile
+      args: { SERVICE: payment }
+    environment:
+      <<: *service-env
+      OTEL_SERVICE_NAME: voltmart-payment
+      # Set to 0.2 to inject random processor failures and watch the checkout
+      # saga compensate in the trace view.
+      PAYMENT_CHAOS_FAILURE_RATE: "0"
+    depends_on: [jaeger]
+
+  checkout:
+    <<: *service-defaults
+    build:
+      context: ./services
+      dockerfile: Dockerfile
+      args: { SERVICE: checkout }
+    environment:
+      <<: *service-env
+      OTEL_SERVICE_NAME: voltmart-checkout
+    depends_on:
+      cart: { condition: service_healthy }
+      inventory: { condition: service_healthy }
+      orders: { condition: service_healthy }
+      payment: { condition: service_healthy }
+
+  # ---- Support agent -----------------------------------------------------
+  support-agent:
+    <<: *service-defaults
+    build:
+      context: ./services
+      dockerfile: Dockerfile
+      args: { SERVICE: support-agent }
+    environment:
+      <<: *service-env
+      OTEL_SERVICE_NAME: voltmart-support-agent
+      AWS_REGION: ${AWS_REGION:-us-west-2}
+      BEDROCK_REGION: ${AWS_REGION:-us-west-2}
+      BEDROCK_MODEL_ID: ${BEDROCK_MODEL_ID:-us.anthropic.claude-sonnet-4-5-20250929-v1:0}
+      # Honoured if present. Prefer the mounted credentials file below; an
+      # access key in a shell history is a bad habit even locally.
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-}
+      AWS_SESSION_TOKEN: ${AWS_SESSION_TOKEN:-}
+      AWS_PROFILE: ${AWS_PROFILE:-}
+    volumes:
+      # Read-only mount of your AWS config so the agent can reach Bedrock
+      # without credentials being baked into the image or passed on a command
+      # line. Comment out if you would rather not expose it to a container.
+      - ${HOME}/.aws:/home/voltmart/.aws:ro
+    depends_on:
+      catalog: { condition: service_healthy }
+      cart: { condition: service_healthy }
+      orders: { condition: service_healthy }
+
+  # ---- Storefront --------------------------------------------------------
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    environment:
+      CATALOG_UPSTREAM: http://catalog:8080
+      INVENTORY_UPSTREAM: http://inventory:8080
+      CART_UPSTREAM: http://cart:8080
+      ORDERS_UPSTREAM: http://orders:8080
+      CHECKOUT_UPSTREAM: http://checkout:8080
+      AGENT_UPSTREAM: http://support-agent:8080
+      # Docker's embedded DNS server. The equivalent of the cluster's kube-dns
+      # address in the EKS deployment.
+      NGINX_RESOLVER: 127.0.0.11
+    ports:
+      # Bound to loopback, not 0.0.0.0. Publishing a development stack on every
+      # interface puts it on your local network, and this one has no
+      # authentication at all.
+      - "127.0.0.1:8080:8080"
+    depends_on:
+      catalog: { condition: service_healthy }
+      cart: { condition: service_healthy }
+      checkout: { condition: service_healthy }

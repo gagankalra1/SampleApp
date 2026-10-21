@@ -1,0 +1,101 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    color-scheme: dark;
+  }
+
+  html {
+    scroll-behavior: smooth;
+  }
+
+  body {
+    /* Two very soft radial washes behind everything, so large dark surfaces
+       don't read as flat black. */
+    background-image:
+      radial-gradient(60rem 60rem at 15% -10%, rgb(99 102 241 / 0.08), transparent 60%),
+      radial-gradient(50rem 50rem at 95% 0%, rgb(6 182 212 / 0.06), transparent 55%);
+    background-attachment: fixed;
+  }
+
+  /* Visible keyboard focus everywhere. Removing outlines without replacing
+     them is the single most common accessibility regression in a dark theme. */
+  :focus-visible {
+    outline: 2px solid theme('colors.volt.400');
+    outline-offset: 2px;
+    border-radius: 4px;
+  }
+
+  ::selection {
+    background-color: theme('colors.volt.500');
+    color: white;
+  }
+}
+
+@layer components {
+  .card {
+    @apply rounded-2xl border border-white/5 bg-ink-850/70 shadow-card backdrop-blur-sm;
+  }
+
+  .btn {
+    @apply inline-flex items-center justify-center gap-2 rounded-xl px-4 py-2.5 text-sm
+           font-medium transition-all duration-150 disabled:cursor-not-allowed
+           disabled:opacity-40;
+  }
+
+  .btn-primary {
+    @apply btn bg-volt-600 text-white hover:bg-volt-500 active:scale-[0.98]
+           hover:shadow-glow;
+  }
+
+  .btn-ghost {
+    @apply btn border border-white/10 bg-white/[0.03] text-slate-200
+           hover:border-white/20 hover:bg-white/[0.07];
+  }
+
+  .input {
+    @apply w-full rounded-xl border border-white/10 bg-ink-900/80 px-3.5 py-2.5
+           text-sm text-slate-100 placeholder:text-slate-500
+           focus:border-volt-500 focus:outline-none focus:ring-1 focus:ring-volt-500;
+  }
+
+  .label {
+    @apply mb-1.5 block text-xs font-medium uppercase tracking-wide text-slate-400;
+  }
+
+  .pill {
+    @apply inline-flex items-center gap-1.5 rounded-full px-2.5 py-1 text-[11px]
+           font-medium tracking-wide;
+  }
+
+  .skeleton {
+    @apply rounded-xl bg-gradient-to-r from-ink-800 via-ink-700 to-ink-800
+           bg-[length:200%_100%] animate-shimmer;
+  }
+}
+
+/* Thin, unobtrusive scrollbars in the chat panel and long lists. */
+.scroll-slim::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+.scroll-slim::-webkit-scrollbar-track {
+  background: transparent;
+}
+.scroll-slim::-webkit-scrollbar-thumb {
+  background: rgb(51 58 92 / 0.8);
+  border-radius: 999px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}

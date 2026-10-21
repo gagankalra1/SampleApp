@@ -1,0 +1,55 @@
+# Base manifests for VoltMart.
+#
+# Apply with:
+#   kubectl apply -k deploy/k8s/base
+#
+# The deploy script does not apply this directly. It first rewrites the image
+# references to the account's ECR repositories and patches the ConfigMaps with
+# the CloudFormation outputs, then applies. Everything here is valid on its
+# own, so `kustomize build deploy/k8s/base` works with no AWS account and is
+# what the lint step in scripts/validate.sh checks.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: voltmart
+
+resources:
+  # Order matters on a first apply: the namespace must exist before anything
+  # in it, and ConfigMaps before the Deployments that read them.
+  - namespace.yaml
+  - config.yaml
+  - tables-config.yaml
+  - observability-config.yaml
+  - collector.yaml
+  - services.yaml
+  - support-agent.yaml
+  - frontend.yaml
+  - network-policy.yaml
+  - autoscaling.yaml
+  - ingress.yaml
+
+commonLabels:
+  app.kubernetes.io/part-of: voltmart
+  app.kubernetes.io/managed-by: kustomize
+
+# Rewritten by the deploy script with `kustomize edit set image` so that each
+# tag is the git short SHA of the build, not `latest`. Immutable tags mean a
+# rollback is `kubectl rollout undo` rather than a guess about which build is
+# running.
+images:
+  - name: voltmart/catalog
+    newTag: latest
+  - name: voltmart/inventory
+    newTag: latest
+  - name: voltmart/cart
+    newTag: latest
+  - name: voltmart/orders
+    newTag: latest
+  - name: voltmart/payment
+    newTag: latest
+  - name: voltmart/checkout
+    newTag: latest
+  - name: voltmart/support-agent
+    newTag: latest
+  - name: voltmart/frontend
+    newTag: latest

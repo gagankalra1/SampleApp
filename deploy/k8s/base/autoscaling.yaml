@@ -1,0 +1,169 @@
+# Horizontal autoscaling for the tiers that see bursty load.
+#
+# Requires metrics-server, which the deploy script installs.
+#
+# The support agent is deliberately *not* autoscaled on CPU. Its bottleneck is
+# Bedrock latency, not CPU, so CPU-based scaling would never trigger while
+# requests queued — and scaling it up multiplies the token spend. Raise its
+# replica count by hand if a workshop needs more concurrency.
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: voltmart-frontend
+  namespace: voltmart
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: voltmart-frontend
+  minReplicas: 2
+  maxReplicas: 6
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target: { type: Utilization, averageUtilization: 70 }
+  behavior:
+    scaleDown:
+      # Wait out a lull before giving capacity back, so a spiky workshop
+      # demo does not flap between replica counts.
+      stabilizationWindowSeconds: 300
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: voltmart-catalog
+  namespace: voltmart
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: voltmart-catalog
+  minReplicas: 2
+  maxReplicas: 8
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target: { type: Utilization, averageUtilization: 70 }
+  behavior:
+    scaleDown:
+      stabilizationWindowSeconds: 300
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: voltmart-cart
+  namespace: voltmart
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: voltmart-cart
+  minReplicas: 2
+  maxReplicas: 8
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target: { type: Utilization, averageUtilization: 70 }
+  behavior:
+    scaleDown:
+      stabilizationWindowSeconds: 300
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: voltmart-checkout
+  namespace: voltmart
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: voltmart-checkout
+  minReplicas: 2
+  maxReplicas: 6
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target: { type: Utilization, averageUtilization: 65 }
+  behavior:
+    scaleUp:
+      # Checkout is the revenue path: add capacity quickly rather than
+      # waiting out the default stabilisation window.
+      stabilizationWindowSeconds: 0
+    scaleDown:
+      stabilizationWindowSeconds: 300
+---
+# Keep one of each service available through node drains and cluster upgrades.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: voltmart-catalog
+  namespace: voltmart
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels: { app.kubernetes.io/name: catalog, app.kubernetes.io/part-of: voltmart }
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: voltmart-inventory
+  namespace: voltmart
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels: { app.kubernetes.io/name: inventory, app.kubernetes.io/part-of: voltmart }
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: voltmart-cart
+  namespace: voltmart
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels: { app.kubernetes.io/name: cart, app.kubernetes.io/part-of: voltmart }
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: voltmart-orders
+  namespace: voltmart
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels: { app.kubernetes.io/name: orders, app.kubernetes.io/part-of: voltmart }
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: voltmart-payment
+  namespace: voltmart
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels: { app.kubernetes.io/name: payment, app.kubernetes.io/part-of: voltmart }
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: voltmart-checkout
+  namespace: voltmart
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels: { app.kubernetes.io/name: checkout, app.kubernetes.io/part-of: voltmart }
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: voltmart-support-agent
+  namespace: voltmart
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels: { app.kubernetes.io/name: support-agent, app.kubernetes.io/part-of: voltmart }

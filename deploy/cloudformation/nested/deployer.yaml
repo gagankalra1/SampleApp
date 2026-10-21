@@ -1,0 +1,466 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  VoltMart deployer. A CodeBuild project that builds the eight container
+  images, pushes them to ECR and applies the Kubernetes manifests, driven by
+  a custom resource so that a single CloudFormation stack produces a running
+  application.
+
+# How this works, and the two problems it solves
+# ----------------------------------------------
+# CloudFormation cannot build a container image or run kubectl. Something has
+# to, and in a single-template workshop deployment that something has to run
+# inside the stack. CodeBuild does the work; a small Lambda-backed custom
+# resource starts it.
+#
+# Problem 1: CloudFormation will not wait for a CodeBuild build.
+#   Solved with a WaitCondition. The custom resource starts the build and
+#   hands it a pre-signed callback URL; the buildspec signals success or
+#   failure at the end. The stack blocks on the WaitCondition, so a failed
+#   deploy fails the stack instead of reporting CREATE_COMPLETE on a broken
+#   application.
+#
+# Problem 2: the stack will not delete cleanly.
+#   The AWS Load Balancer Controller creates an ALB and a security group that
+#   CloudFormation does not know about. On delete, CloudFormation tries to
+#   remove the VPC, the orphaned ALB's network interfaces are still attached,
+#   and the stack lands in DELETE_FAILED — requiring manual cleanup in every
+#   workshop account.
+#
+#   So the custom resource also handles Delete: it runs a teardown build that
+#   removes the Ingress, waits for the load balancer to actually disappear,
+#   and only then lets the delete proceed.
+
+Parameters:
+  NamePrefix:
+    Type: String
+
+  ClusterName:
+    Type: String
+
+  AssetsBucket:
+    Type: String
+    Description: S3 bucket holding the source archive published by scripts/publish-assets.sh.
+
+  AssetsPrefix:
+    Type: String
+    Description: Key prefix within the assets bucket, e.g. voltmart/v1.
+
+  RegistryUri:
+    Type: String
+    Description: Base ECR URI to push images under.
+
+  LoadBalancerControllerRoleArn:
+    Type: String
+    Description: Role the load balancer controller's service account is bound to.
+
+  VpcId:
+    Type: String
+
+  PrometheusRemoteWriteUrl:
+    Type: String
+
+  InventoryTableName:
+    Type: String
+  CartsTableName:
+    Type: String
+  OrdersTableName:
+    Type: String
+  PaymentsTableName:
+    Type: String
+  ConversationsTableName:
+    Type: String
+
+  BedrockModelId:
+    Type: String
+
+  AllowedIngressCidr:
+    Type: String
+    Description: CIDR permitted to reach the public load balancer.
+
+  DeployerLogGroupName:
+    Type: String
+
+  DeployerRoleArn:
+    Type: String
+    Description: >-
+      Role the build runs as, created by the deployer-role stack. It lives
+      there rather than here because the EKS cluster needs its ARN before this
+      stack can exist.
+
+  DeployTimeoutMinutes:
+    Type: Number
+    Default: 45
+    MinValue: 15
+    MaxValue: 120
+    Description: >-
+      How long to wait for the build and deploy. Eight images built from
+      scratch plus a rollout usually completes in 15-25 minutes.
+
+Resources:
+  # =========================================================================
+  # CodeBuild
+  # =========================================================================
+  DeployerProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub '${NamePrefix}-deployer'
+      Description: Builds VoltMart images and deploys them to the EKS cluster.
+      ServiceRole: !Ref DeployerRoleArn
+      TimeoutInMinutes: !Ref DeployTimeoutMinutes
+      Artifacts:
+        Type: NO_ARTIFACTS
+      Source:
+        Type: S3
+        Location: !Sub '${AssetsBucket}/${AssetsPrefix}/source.zip'
+        BuildSpec: deploy/codebuild/buildspec-deploy.yml
+      Environment:
+        Type: LINUX_CONTAINER
+        # Eight images, several with native wheels to compile. The larger
+        # compute roughly halves the build and is only billed per build
+        # minute, so it is cheaper overall than the small instance.
+        ComputeType: BUILD_GENERAL1_LARGE
+        Image: aws/codebuild/amazonlinux2-x86_64-standard:5.0
+        # Required to run `docker build`.
+        PrivilegedMode: true
+        EnvironmentVariables:
+          - { Name: AWS_REGION_NAME, Value: !Ref 'AWS::Region' }
+          - { Name: CLUSTER_NAME, Value: !Ref ClusterName }
+          - { Name: NAME_PREFIX, Value: !Ref NamePrefix }
+          - { Name: REGISTRY_URI, Value: !Ref RegistryUri }
+          - { Name: LB_CONTROLLER_ROLE_ARN, Value: !Ref LoadBalancerControllerRoleArn }
+          - { Name: VPC_ID, Value: !Ref VpcId }
+          - { Name: AMP_REMOTE_WRITE_URL, Value: !Ref PrometheusRemoteWriteUrl }
+          - { Name: INVENTORY_TABLE, Value: !Ref InventoryTableName }
+          - { Name: CART_TABLE, Value: !Ref CartsTableName }
+          - { Name: ORDERS_TABLE, Value: !Ref OrdersTableName }
+          - { Name: PAYMENTS_TABLE, Value: !Ref PaymentsTableName }
+          - { Name: CONVERSATIONS_TABLE, Value: !Ref ConversationsTableName }
+          - { Name: BEDROCK_MODEL_ID, Value: !Ref BedrockModelId }
+          - { Name: ALLOWED_INGRESS_CIDR, Value: !Ref AllowedIngressCidr }
+      LogsConfig:
+        CloudWatchLogs:
+          Status: ENABLED
+          GroupName: !Ref DeployerLogGroupName
+          StreamName: build
+      Tags:
+        - { Key: Project, Value: voltmart }
+
+  # =========================================================================
+  # Custom resource that drives the build
+  # =========================================================================
+  TriggerFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: start-deployer-build
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - codebuild:StartBuild
+                  - codebuild:BatchGetBuilds
+                  - codebuild:StopBuild
+                Resource: !GetAtt DeployerProject.Arn
+
+  TriggerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${NamePrefix}-deploy-trigger'
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt TriggerFunctionRole.Arn
+      # Delete waits inline for the teardown build, which takes a few minutes
+      # while the load balancer is removed.
+      Timeout: 900
+      MemorySize: 256
+      Code:
+        ZipFile: |
+          """Starts the VoltMart deployer build from CloudFormation.
+
+          Create/Update: fire the deploy build and return immediately. The
+          build signals the stack's WaitCondition when it finishes, so
+          CloudFormation blocks there rather than here (a Lambda cannot wait
+          45 minutes).
+
+          Delete: run the teardown build and wait for it, because the stack
+          must not start deleting the VPC until the Kubernetes-created load
+          balancer is gone.
+          """
+          import json
+          import time
+          import urllib.request
+
+          import boto3
+
+          codebuild = boto3.client("codebuild")
+
+
+          def respond(event, context, status, reason="", data=None):
+              """Send the CloudFormation custom resource response."""
+              body = json.dumps({
+                  "Status": status,
+                  "Reason": (reason or "See CloudWatch log stream " + context.log_stream_name)[:1000],
+                  "PhysicalResourceId": event.get("PhysicalResourceId") or context.log_stream_name,
+                  "StackId": event["StackId"],
+                  "RequestId": event["RequestId"],
+                  "LogicalResourceId": event["LogicalResourceId"],
+                  "NoEcho": False,
+                  "Data": data or {},
+              }).encode()
+
+              request = urllib.request.Request(
+                  event["ResponseURL"], data=body, method="PUT",
+                  headers={"content-type": "", "content-length": str(len(body))},
+              )
+              urllib.request.urlopen(request, timeout=30)
+
+
+          def start(project, mode, wait_handle=""):
+              overrides = [
+                  {"name": "DEPLOY_MODE", "value": mode, "type": "PLAINTEXT"},
+                  {"name": "WAIT_CONDITION_URL", "value": wait_handle, "type": "PLAINTEXT"},
+              ]
+              kwargs = {
+                  "projectName": project,
+                  "environmentVariablesOverride": overrides,
+              }
+              if mode == "destroy":
+                  # A separate, much shorter buildspec: no image builds, just
+                  # remove the Ingress and wait for the ALB to go away.
+                  kwargs["buildspecOverride"] = "deploy/codebuild/buildspec-destroy.yml"
+              return codebuild.start_build(**kwargs)["build"]["id"]
+
+
+          def wait_for(build_id, deadline):
+              """Poll a build to completion. Returns (succeeded, status)."""
+              while time.time() < deadline:
+                  build = codebuild.batch_get_builds(ids=[build_id])["builds"][0]
+                  status = build["buildStatus"]
+                  if status != "IN_PROGRESS":
+                      return status == "SUCCEEDED", status
+                  time.sleep(15)
+              return False, "TIMED_OUT"
+
+
+          def handler(event, context):
+              print("event:", json.dumps({k: v for k, v in event.items() if k != "ResponseURL"}))
+              request_type = event["RequestType"]
+              props = event["ResourceProperties"]
+              project = props["ProjectName"]
+
+              try:
+                  if request_type in ("Create", "Update"):
+                      build_id = start(project, "deploy", props.get("WaitConditionUrl", ""))
+                      print("started deploy build", build_id)
+                      # Return now. The build owns the WaitCondition signal, so
+                      # a build failure still fails the stack.
+                      respond(event, context, "SUCCESS", "Deploy build started",
+                              {"BuildId": build_id})
+                      return
+
+                  # ---- Delete ----
+                  # Best effort by design: if teardown cannot run, the stack
+                  # delete should still proceed rather than get stuck in
+                  # DELETE_FAILED forever. A leftover load balancer is
+                  # annoying; an undeletable stack is worse.
+                  try:
+                      build_id = start(project, "destroy")
+                      print("started teardown build", build_id)
+                      # Leave 60s of headroom to send the response.
+                      ok, status = wait_for(build_id, time.time() + context.get_remaining_time_in_millis() / 1000 - 60)
+                      print("teardown finished:", status)
+                      reason = f"Teardown build {status}"
+                  except Exception as exc:  # noqa: BLE001
+                      print("teardown could not run:", exc)
+                      reason = f"Teardown skipped: {exc}"
+
+                  respond(event, context, "SUCCESS", reason)
+
+              except Exception as exc:  # noqa: BLE001
+                  print("handler failed:", exc)
+                  respond(event, context, "FAILED", str(exc))
+
+  # Receives the build's success/failure signal.
+  DeployWaitHandle:
+    Type: AWS::CloudFormation::WaitConditionHandle
+
+  Deploy:
+    Type: AWS::CloudFormation::CustomResource
+    Properties:
+      ServiceToken: !GetAtt TriggerFunction.Arn
+      ProjectName: !Ref DeployerProject
+      WaitConditionUrl: !Ref DeployWaitHandle
+      # Changing this forces the custom resource to re-run on a stack update,
+      # which is what redeploys the application after a code change.
+      DeployVersion: !Ref AssetsPrefix
+
+  # =========================================================================
+  # Resolving the storefront URL
+  # =========================================================================
+  # The load balancer is created by the Kubernetes controller, so its DNS name
+  # does not exist in CloudFormation. The build knows it, but a WaitCondition
+  # can only hand back its signal payload as a JSON object keyed by signal id
+  # — fine for gating, useless as a URL to give someone.
+  #
+  # So once the deploy has finished, this looks the address up from the ELB
+  # API and returns it as a plain string. It is the stack's single most
+  # important output: the thing a workshop attendee opens.
+  StorefrontLookupRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: describe-load-balancers
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                # Read-only, and DescribeLoadBalancers cannot be scoped to a
+                # single load balancer ARN.
+                Action: elasticloadbalancing:DescribeLoadBalancers
+                Resource: '*'
+
+  StorefrontLookupFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${NamePrefix}-storefront-url'
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt StorefrontLookupRole.Arn
+      Timeout: 120
+      MemorySize: 128
+      Code:
+        ZipFile: |
+          """Resolves the storefront URL from the load balancer the cluster created."""
+          import json
+          import time
+          import urllib.request
+
+          import boto3
+
+          elb = boto3.client("elbv2")
+
+
+          def respond(event, context, status, reason="", data=None):
+              body = json.dumps({
+                  "Status": status,
+                  "Reason": (reason or "see " + context.log_stream_name)[:1000],
+                  "PhysicalResourceId": event.get("PhysicalResourceId") or context.log_stream_name,
+                  "StackId": event["StackId"],
+                  "RequestId": event["RequestId"],
+                  "LogicalResourceId": event["LogicalResourceId"],
+                  "NoEcho": False,
+                  "Data": data or {},
+              }).encode()
+              request = urllib.request.Request(
+                  event["ResponseURL"], data=body, method="PUT",
+                  headers={"content-type": "", "content-length": str(len(body))},
+              )
+              urllib.request.urlopen(request, timeout=30)
+
+
+          def find(prefix):
+              """Find the load balancer by name prefix.
+
+              Prefix match rather than an exact Names=[...] lookup: ALB names
+              are capped at 32 characters, the deploy script truncates the
+              stack name to fit, and CloudFormation has no way to truncate a
+              string to build the same value here. Matching on the prefix
+              sidesteps the mismatch entirely.
+              """
+              needle = prefix[:32]
+              paginator = elb.get_paginator("describe_load_balancers")
+              for page in paginator.paginate():
+                  for lb in page.get("LoadBalancers", []):
+                      if lb.get("LoadBalancerName", "").startswith(needle) and lb.get("DNSName"):
+                          return lb["DNSName"]
+              return None
+
+
+          def handler(event, context):
+              if event["RequestType"] == "Delete":
+                  # Nothing was created, so there is nothing to remove.
+                  respond(event, context, "SUCCESS", "nothing to delete")
+                  return
+
+              name = event["ResourceProperties"]["LoadBalancerNamePrefix"]
+              try:
+                  dns = None
+                  # The deploy build already waited for the load balancer to
+                  # serve traffic, so this normally succeeds first time. The
+                  # retries cover ELB API eventual consistency.
+                  for _ in range(12):
+                      dns = find(name)
+                      if dns:
+                          break
+                      time.sleep(5)
+
+                  if not dns:
+                      # Not fatal. The application is deployed and working;
+                      # only this convenience output is missing, and failing
+                      # the stack over it would be a poor trade.
+                      respond(event, context, "SUCCESS",
+                              "load balancer not found",
+                              {"Url": "not resolved - run: kubectl -n voltmart get ingress voltmart",
+                               "DnsName": ""})
+                      return
+
+                  respond(event, context, "SUCCESS", "resolved",
+                          {"Url": f"http://{dns}", "DnsName": dns})
+              except Exception as exc:  # noqa: BLE001
+                  print("lookup failed:", exc)
+                  respond(event, context, "SUCCESS", f"lookup failed: {exc}",
+                          {"Url": "not resolved", "DnsName": ""})
+
+  StorefrontUrl:
+    Type: AWS::CloudFormation::CustomResource
+    # Must run after the application is deployed and the load balancer exists.
+    DependsOn: DeployWaitCondition
+    Properties:
+      ServiceToken: !GetAtt StorefrontLookupFunction.Arn
+      # The deploy script sets the Ingress's load-balancer-name annotation to
+      # the first 32 characters of this prefix, so a prefix match finds it
+      # whatever the stack name's length.
+      LoadBalancerNamePrefix: !Ref NamePrefix
+      DeployVersion: !Ref AssetsPrefix
+
+  DeployWaitCondition:
+    Type: AWS::CloudFormation::WaitCondition
+    DependsOn: Deploy
+    Properties:
+      Handle: !Ref DeployWaitHandle
+      # Seconds, and a fixed ceiling rather than a computed one — CloudFormation
+      # has no arithmetic, so deriving this from DeployTimeoutMinutes would mean
+      # a second parameter that can disagree with the first.
+      #
+      # The build's own TimeoutInMinutes is the real limit, and the buildspec
+      # signals FAILURE on any error, so this ceiling is only reached if the
+      # build dies without signalling at all.
+      Timeout: '3600'
+      Count: 1
+
+Outputs:
+  DeployerProjectName:
+    Value: !Ref DeployerProject
+  StorefrontUrl:
+    Description: The VoltMart storefront.
+    Value: !GetAtt StorefrontUrl.Url
+  LoadBalancerDnsName:
+    Description: DNS name of the load balancer the cluster created.
+    Value: !GetAtt StorefrontUrl.DnsName
