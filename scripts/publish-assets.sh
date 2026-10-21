@@ -27,6 +27,7 @@ STACK_NAME="voltmart"
 DO_DEPLOY=false
 ALLOWED_CIDR=""
 BEDROCK_MODEL=""
+ADMIN_PRINCIPAL=""
 
 log()  { printf '\n\033[1;36m==> %s\033[0m\n' "$*"; }
 info() { printf '    %s\n' "$*"; }
@@ -53,6 +54,12 @@ Options:
   --allowed-cidr <cidr>  Restrict who can reach the storefront. Strongly
                          recommended with --deploy.
   --bedrock-model <id>   Override the support agent's model id.
+  --admin-principal <arn>
+                         Grant an ADDITIONAL IAM role or user cluster-admin.
+                         You do not need this for yourself: whoever launches
+                         the stack gets cluster-admin automatically. Passing
+                         your own ARN here fails the stack with a 409, because
+                         EKS already created that access entry.
   -h, --help             Show this message.
 USAGE
 }
@@ -65,6 +72,7 @@ while [[ $# -gt 0 ]]; do
     --stack-name)     STACK_NAME="${2:-}"; shift 2 ;;
     --allowed-cidr)   ALLOWED_CIDR="${2:-}"; shift 2 ;;
     --bedrock-model)  BEDROCK_MODEL="${2:-}"; shift 2 ;;
+    --admin-principal) ADMIN_PRINCIPAL="${2:-}"; shift 2 ;;
     --deploy)         DO_DEPLOY=true; shift ;;
     -h|--help)        usage; exit 0 ;;
     *)                die "unknown option: $1 (try --help)" ;;
@@ -192,11 +200,19 @@ ROOT_TEMPLATE_URL="https://${BUCKET}.s3.${REGION}.amazonaws.com/${PREFIX}/templa
 # ---------------------------------------------------------------------------
 # Launch, or print how to
 # ---------------------------------------------------------------------------
+# AdminPrincipalArn is deliberately NOT set to the caller's ARN.
+#
+# The cluster is created with BootstrapClusterCreatorAdminPermissions, so
+# whoever launches the stack already gets cluster-admin automatically. Asking
+# EKS for a second access entry for that same principal fails with a 409
+# AlreadyExists and rolls back the whole cluster.
+#
+# Pass --admin-principal only to grant a *different* role or user access.
 PARAMS=(
   "ParameterKey=AssetsBucket,ParameterValue=${BUCKET}"
   "ParameterKey=AssetsPrefix,ParameterValue=${PREFIX}"
-  "ParameterKey=AdminPrincipalArn,ParameterValue=${CALLER_ARN}"
 )
+[[ -n "$ADMIN_PRINCIPAL" ]] && PARAMS+=("ParameterKey=AdminPrincipalArn,ParameterValue=${ADMIN_PRINCIPAL}")
 [[ -n "$ALLOWED_CIDR" ]]  && PARAMS+=("ParameterKey=AllowedIngressCidr,ParameterValue=${ALLOWED_CIDR}")
 [[ -n "$BEDROCK_MODEL" ]] && PARAMS+=("ParameterKey=BedrockModelId,ParameterValue=${BEDROCK_MODEL}")
 
@@ -252,10 +268,12 @@ Launch from the CLI
     --parameters \\
       ParameterKey=AssetsBucket,ParameterValue=${BUCKET} \\
       ParameterKey=AssetsPrefix,ParameterValue=${PREFIX} \\
-      ParameterKey=AdminPrincipalArn,ParameterValue=${CALLER_ARN} \\
       ParameterKey=AllowedIngressCidr,ParameterValue=YOUR.IP.RANGE/32 \\
     --capabilities CAPABILITY_NAMED_IAM \\
     --region ${REGION}
+
+  You get cluster-admin automatically as the launching principal, so there is
+  no AdminPrincipalArn to set. Add it only to grant someone else access.
 
 Launch from the console
   https://${REGION}.console.aws.amazon.com/cloudformation/home?region=${REGION}#/stacks/create/review?templateURL=$(printf '%s' "$ROOT_TEMPLATE_URL" | sed 's|:|%3A|g; s|/|%2F|g')&stackName=${STACK_NAME}

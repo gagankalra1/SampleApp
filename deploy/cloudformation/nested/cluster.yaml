@@ -74,9 +74,15 @@ Parameters:
     Type: String
     Default: ''
     Description: >-
-      Optional IAM role or user ARN to grant cluster-admin. Set this to your
-      own role so you can run kubectl after the stack finishes; without it,
-      only the stack's deployer role can reach the cluster.
+      Optional IAM role or user ARN to grant cluster-admin, IN ADDITION to
+      whoever launches the stack.
+
+      Do NOT set this to your own ARN. BootstrapClusterCreatorAdminPermissions
+      below already gives the launching principal cluster-admin, and asking
+      EKS for a second access entry for the same principal fails the stack
+      with a 409 AlreadyExists. Use this only to grant a *different* role or
+      user access — a teammate, or an attendee role that differs from the
+      provisioning identity.
 
   DeployerRoleArn:
     Type: String
@@ -187,6 +193,13 @@ Resources:
           AccessScope:
             Type: cluster
 
+  # Grants a principal *other than* the stack launcher cluster-admin.
+  #
+  # The launcher does not need an entry here and must not be given one: with
+  # BootstrapClusterCreatorAdminPermissions: true, EKS has already created an
+  # access entry for whoever created the cluster. A second entry for the same
+  # principal is rejected with "access entry resource is already in use"
+  # (409 AlreadyExists), which fails this stack and rolls back the cluster.
   AdminAccessEntry:
     Type: AWS::EKS::AccessEntry
     Condition: HasAdminPrincipal
