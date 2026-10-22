@@ -68,10 +68,18 @@ else
   # and its security group takes a few minutes. The ENIs are what block the
   # subnet delete, and they go when the ALB does.
   for attempt in $(seq 1 60); do
-    remaining=$(aws elbv2 describe-load-balancers \
-      --region "$AWS_REGION_NAME" \
-      --query "length(LoadBalancers[?starts_with(LoadBalancerName, '${CLUSTER_NAME:0:32}')])" \
-      --output text 2>/dev/null || echo 0)
+    # A failed query must not look like "nothing left". Defaulting the error
+    # case to 0 would report success and skip the wait, which is precisely the
+    # failure this loop exists to prevent: the stack would then fail deleting
+    # the VPC with the load balancer's ENIs still attached to its subnets.
+    if ! remaining=$(aws elbv2 describe-load-balancers \
+          --region "$AWS_REGION_NAME" \
+          --query "length(LoadBalancers[?starts_with(LoadBalancerName, '${CLUSTER_NAME:0:32}')])" \
+          --output text 2>/dev/null); then
+      warn "could not query load balancers; retrying rather than assuming none remain"
+      sleep 10
+      continue
+    fi
 
     if [[ "$remaining" == "0" ]]; then
       info "load balancer removed"
