@@ -233,14 +233,38 @@ spec:
       ports:
         - { protocol: UDP, port: 53 }
         - { protocol: TCP, port: 53 }
+    # The EKS Pod Identity Agent. This is how every pod gets its AWS
+    # credentials, and it is plain HTTP on port 80 to a link-local address
+    # (http://169.254.170.23/v1/credentials).
+    #
+    # Easy to miss, and the failure is badly misleading: the pods come up,
+    # then crash with
+    #   CredentialRetrievalError: Error when retrieving credentials from
+    #   container-role
+    # which reads like an IAM or Pod Identity misconfiguration. It is neither
+    # — the association is fine and the role is correct, the egress rule below
+    # was simply absent, so the SDK could not reach the agent at all.
+    #
+    # Only the services that touch AWS are affected, which makes it look
+    # stranger still: catalog, checkout and the frontend need no credentials
+    # and come up perfectly while everything else crash-loops.
+    - to:
+        - ipBlock:
+            cidr: 169.254.170.23/32
+      ports:
+        - { protocol: TCP, port: 80 }
+
     # HTTPS to AWS service endpoints.
     - to:
         - ipBlock:
             cidr: 0.0.0.0/0
             except:
               # Block the instance metadata service. Pods get credentials from
-              # Pod Identity; reaching IMDS would let a compromised pod borrow
-              # the node role, which is far more powerful.
+              # Pod Identity (allowed above); reaching IMDS would let a
+              # compromised pod borrow the node role, which is far more
+              # powerful. Note the two addresses differ by one octet —
+              # .169.254 is IMDS and stays blocked, .170.23 is Pod Identity
+              # and is required.
               - 169.254.169.254/32
       ports:
         - { protocol: TCP, port: 443 }

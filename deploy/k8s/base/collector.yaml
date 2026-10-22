@@ -218,7 +218,17 @@ data:
           encoding: json
         metrics:
           level: basic
-          address: 0.0.0.0:8888
+          # `address: 0.0.0.0:8888` was removed from the collector's config
+          # schema and replaced by this readers block. Leaving it in fails
+          # start-up outright, with:
+          #   'service.telemetry.metrics' has invalid keys: address
+          # which crash-loops the collector before it reads anything else.
+          readers:
+            - pull:
+                exporter:
+                  prometheus:
+                    host: 0.0.0.0
+                    port: 8888
       pipelines:
         traces:
           receivers: [otlp]
