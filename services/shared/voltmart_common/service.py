@@ -16,6 +16,9 @@ from typing import Any, Awaitable, Callable
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+# Imported so configure_logging can recognise and preserve the OTLP log
+# handler that configure_telemetry installs.
+from opentelemetry.sdk._logs import LoggingHandler
 
 from .config import server_config
 from .errors import install_error_handlers
@@ -63,9 +66,19 @@ def configure_logging(service_name: str, level: str = "info") -> logging.Logger:
     handler.setFormatter(_JsonFormatter(service_name))
 
     root = logging.getLogger()
-    # Replace the default handler rather than adding to it, so each line is
-    # emitted once, as JSON.
-    root.handlers = [handler]
+
+    # Replace only the stream handlers, so each line is emitted once as JSON.
+    #
+    # Critically, this must NOT clear the whole handler list. configure_telemetry
+    # runs first and attaches an OpenTelemetry LoggingHandler that ships logs
+    # over OTLP; `root.handlers = [handler]` removed it again immediately, so
+    # log export silently never happened and /aws/voltmart/application stayed
+    # empty while traces and metrics flowed normally.
+    preserved = [
+        h for h in root.handlers
+        if not isinstance(h, logging.StreamHandler) or isinstance(h, LoggingHandler)
+    ]
+    root.handlers = [*preserved, handler]
     root.setLevel(getattr(logging, level.upper(), logging.INFO))
 
     # uvicorn installs its own handlers; route them through ours instead.

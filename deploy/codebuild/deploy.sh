@@ -174,21 +174,20 @@ KUBE_DNS_IP=$(kubectl -n kube-system get service kube-dns \
   -o jsonpath='{.spec.clusterIP}' 2>/dev/null || echo "172.20.0.10")
 info "cluster DNS is at ${KUBE_DNS_IP}"
 
-# Table names from the data stack.
-kubectl create configmap voltmart-tables \
-  --namespace voltmart \
-  --from-literal="INVENTORY_TABLE=${INVENTORY_TABLE}" \
-  --from-literal="CART_TABLE=${CART_TABLE}" \
-  --from-literal="ORDERS_TABLE=${ORDERS_TABLE}" \
-  --from-literal="PAYMENTS_TABLE=${PAYMENTS_TABLE}" \
-  --from-literal="CONVERSATIONS_TABLE=${CONVERSATIONS_TABLE}" \
-  --dry-run=client -o yaml | kubectl apply -f -
-
-# The Prometheus remote-write endpoint from the observability stack.
-kubectl create configmap voltmart-observability \
-  --namespace voltmart \
-  --from-literal="AMP_REMOTE_WRITE_URL=${AMP_REMOTE_WRITE_URL}" \
-  --dry-run=client -o yaml | kubectl apply -f -
+# The table names and the Prometheus endpoint are NOT written here.
+#
+# They used to be, with `kubectl create configmap ... | kubectl apply -f -`
+# before the manifests were applied — and the kustomize apply that followed
+# promptly overwrote them with the placeholders from
+# deploy/k8s/base/*-config.yaml.
+#
+# That bug hid itself nicely. The placeholder table names are the ones a stack
+# called "voltmart" produces, so DynamoDB worked perfectly and only the
+# Prometheus URL was visibly wrong (ws-PLACEHOLDER). Any other stack name and
+# every table lookup would have failed instead.
+#
+# Both are now patched into the overlay below, so there is exactly one apply
+# and nothing can overwrite anything.
 
 # ===========================================================================
 # 5. Build an overlay and apply
@@ -263,6 +262,36 @@ patches:
       - op: replace
         path: /metadata/annotations/alb.ingress.kubernetes.io~1load-balancer-name
         value: "${NAME_PREFIX:0:32}"
+  # The real DynamoDB table names from the data stack, replacing the
+  # placeholders the base carries so it can be built without an AWS account.
+  - target:
+      kind: ConfigMap
+      name: voltmart-tables
+    patch: |
+      - op: replace
+        path: /data/INVENTORY_TABLE
+        value: "${INVENTORY_TABLE}"
+      - op: replace
+        path: /data/CART_TABLE
+        value: "${CART_TABLE}"
+      - op: replace
+        path: /data/ORDERS_TABLE
+        value: "${ORDERS_TABLE}"
+      - op: replace
+        path: /data/PAYMENTS_TABLE
+        value: "${PAYMENTS_TABLE}"
+      - op: replace
+        path: /data/CONVERSATIONS_TABLE
+        value: "${CONVERSATIONS_TABLE}"
+  # The real Prometheus workspace endpoint. Without this the collector sends
+  # metrics to ws-PLACEHOLDER and gets "Workspace not found".
+  - target:
+      kind: ConfigMap
+      name: voltmart-observability
+    patch: |
+      - op: replace
+        path: /data/AMP_REMOTE_WRITE_URL
+        value: "${AMP_REMOTE_WRITE_URL}"
 EOF
 
 # Patch the frontend's resolver separately: a strategic merge patch is much
