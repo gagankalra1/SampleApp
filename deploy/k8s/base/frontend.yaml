@@ -85,18 +85,28 @@ spec:
             # Upstreams for the proxy. Substituted into the nginx config at
             # container start, so re-pointing the frontend at a different
             # backend is a manifest edit rather than an image rebuild.
+            #
+            # These must be FULLY QUALIFIED. nginx's `resolver` directive does
+            # not read the search domains from /etc/resolv.conf, so a short
+            # name like `voltmart-catalog` is queried literally and comes back
+            # NXDOMAIN — every API route then returns 502 while the backends
+            # are perfectly healthy.
+            #
+            # It is a confusing failure to chase, because anything else in the
+            # same pod resolves the short name fine: `wget http://voltmart-catalog:8080`
+            # works, since wget uses the system resolver and nginx does not.
             - name: CATALOG_UPSTREAM
-              value: http://voltmart-catalog:8080
+              value: http://voltmart-catalog.voltmart.svc.cluster.local:8080
             - name: INVENTORY_UPSTREAM
-              value: http://voltmart-inventory:8080
+              value: http://voltmart-inventory.voltmart.svc.cluster.local:8080
             - name: CART_UPSTREAM
-              value: http://voltmart-cart:8080
+              value: http://voltmart-cart.voltmart.svc.cluster.local:8080
             - name: ORDERS_UPSTREAM
-              value: http://voltmart-orders:8080
+              value: http://voltmart-orders.voltmart.svc.cluster.local:8080
             - name: CHECKOUT_UPSTREAM
-              value: http://voltmart-checkout:8080
+              value: http://voltmart-checkout.voltmart.svc.cluster.local:8080
             - name: AGENT_UPSTREAM
-              value: http://voltmart-support-agent:8080
+              value: http://voltmart-support-agent.voltmart.svc.cluster.local:8080
             # Cluster DNS, so nginx resolves upstreams per request instead of
             # refusing to start when a backend Service does not exist yet.
             # Patched by the deploy script from the cluster's actual kube-dns
