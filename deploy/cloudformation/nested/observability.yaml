@@ -83,28 +83,21 @@ Resources:
       Tags:
         - { Key: Project, Value: voltmart }
 
-  DeployerLogGroup:
-    Type: AWS::Logs::LogGroup
-    # Retained on purpose, unlike every other resource in this stack.
-    #
-    # This log is the only record of why a deploy failed. Deleting it with the
-    # stack means a rollback destroys the evidence at exactly the moment you
-    # need it: CloudFormation reports "WaitCondition timed out", the log group
-    # is already gone, and there is nothing left to read.
-    #
-    # The cost is a small orphaned log group after a stack delete, which
-    # expires on its own via RetentionInDays below. That is a much better
-    # trade than losing the diagnosis.
-    DeletionPolicy: Retain
-    UpdateReplacePolicy: Retain
-    Properties:
-      LogGroupName: !Sub '/aws/voltmart/${NamePrefix}/deployer'
-      # Longer than the rest on purpose: when a workshop deployment fails,
-      # this log is the only record of why, and it needs to outlive the
-      # troubleshooting session.
-      RetentionInDays: 30
-      Tags:
-        - { Key: Project, Value: voltmart }
+  # The deployer's log group is deliberately NOT a CloudFormation resource.
+  #
+  # It is the only record of why a deploy failed, so it has to outlive the
+  # stack — a rollback that deletes it destroys the evidence at precisely the
+  # moment it is needed, leaving nothing behind but "WaitCondition timed out".
+  #
+  # But DeletionPolicy: Retain does not solve that, it just moves the problem:
+  # the retained group then blocks the *next* create with AlreadyExists, so
+  # the stack can be deployed exactly once and every retry fails in 15
+  # seconds.
+  #
+  # So CodeBuild creates the group itself on first write (it has
+  # logs:CreateLogGroup), and deploy.sh sets the retention. Nothing owns it,
+  # it survives any number of rollbacks, redeploys reuse it, and it still
+  # expires on its own rather than accumulating cost forever.
 
   # =========================================================================
   # Alarms
@@ -331,7 +324,10 @@ Outputs:
   MetricsLogGroupName:
     Value: !Ref MetricsLogGroup
   DeployerLogGroupName:
-    Value: !Ref DeployerLogGroup
+    Description: >-
+      Where the deploy build logs. Created by CodeBuild rather than by this
+      stack, so that a rollback cannot delete the record of why it rolled back.
+    Value: !Sub '/aws/voltmart/${NamePrefix}/deployer'
   AlarmTopicArn:
     Value: !Ref AlarmTopic
   DashboardUrl:

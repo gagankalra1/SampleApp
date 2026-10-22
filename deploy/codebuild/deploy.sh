@@ -66,6 +66,21 @@ trap on_exit EXIT
 # ===========================================================================
 # 1. Tools and cluster access
 # ===========================================================================
+# Set retention on our own log group. CodeBuild created it on first write, and
+# nothing in CloudFormation owns it — deliberately, so that a rollback cannot
+# delete the record of why it rolled back. The trade is that retention has to
+# be applied here instead of declared in the template.
+#
+# Best effort: failing to set retention must not fail a deployment.
+if [[ -n "${CODEBUILD_LOG_GROUP:-/aws/voltmart/${NAME_PREFIX}/deployer}" ]]; then
+  aws logs put-retention-policy \
+    --log-group-name "/aws/voltmart/${NAME_PREFIX}/deployer" \
+    --retention-in-days 30 \
+    --region "$AWS_REGION_NAME" 2>/dev/null \
+    && info "deployer log retention set to 30 days" \
+    || warn "could not set log retention (the log is still being written)"
+fi
+
 log "Installing tools"
 install_kubectl
 install_helm
