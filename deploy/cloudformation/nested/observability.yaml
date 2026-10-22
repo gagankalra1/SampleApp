@@ -85,8 +85,18 @@ Resources:
 
   DeployerLogGroup:
     Type: AWS::Logs::LogGroup
-    DeletionPolicy: Delete
-    UpdateReplacePolicy: Delete
+    # Retained on purpose, unlike every other resource in this stack.
+    #
+    # This log is the only record of why a deploy failed. Deleting it with the
+    # stack means a rollback destroys the evidence at exactly the moment you
+    # need it: CloudFormation reports "WaitCondition timed out", the log group
+    # is already gone, and there is nothing left to read.
+    #
+    # The cost is a small orphaned log group after a stack delete, which
+    # expires on its own via RetentionInDays below. That is a much better
+    # trade than losing the diagnosis.
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
     Properties:
       LogGroupName: !Sub '/aws/voltmart/${NamePrefix}/deployer'
       # Longer than the rest on purpose: when a workshop deployment fails,

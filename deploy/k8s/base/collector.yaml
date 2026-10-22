@@ -352,6 +352,17 @@ spec:
             # memory_limiter engages before the kernel does.
             - name: GOMEMLIMIT
               value: "400MiB"
+            # The ADOT image ships a named user `aoc` with HOME=/home/aoc,
+            # but the pod security context forces uid 10001 — which owns no
+            # home directory, and cannot create one under a read-only root
+            # filesystem. Point HOME at the writable emptyDir instead.
+            #
+            # Without this the AWS SDK has nowhere to resolve or cache
+            # credentials, which is a confusing way for a hardened container
+            # to fail: the config is valid and the image is correct, but the
+            # process cannot write to its own home.
+            - name: HOME
+              value: /tmp
           resources:
             requests:
               cpu: 100m

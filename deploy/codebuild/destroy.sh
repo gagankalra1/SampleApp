@@ -68,7 +68,7 @@ else
   # and its security group takes a few minutes. The ENIs are what block the
   # subnet delete, and they go when the ALB does.
   for attempt in $(seq 1 60); do
-    remaining=$(aws elasticloadbalancing describe-load-balancers \
+    remaining=$(aws elbv2 describe-load-balancers \
       --region "$AWS_REGION_NAME" \
       --query "length(LoadBalancers[?starts_with(LoadBalancerName, '${CLUSTER_NAME:0:32}')])" \
       --output text 2>/dev/null || echo 0)
@@ -105,7 +105,7 @@ fi
 # If something is, this message is what tells whoever reads the log where to
 # look instead of leaving them to guess at a DELETE_FAILED.
 log "Checking for leftover load balancers"
-leftovers=$(aws elasticloadbalancing describe-load-balancers \
+leftovers=$(aws elbv2 describe-load-balancers \
   --region "$AWS_REGION_NAME" \
   --query "LoadBalancers[?starts_with(LoadBalancerName, '${CLUSTER_NAME:0:32}')].LoadBalancerArn" \
   --output text 2>/dev/null)

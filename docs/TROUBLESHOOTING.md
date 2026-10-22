@@ -79,12 +79,12 @@ The stack's teardown build normally prevents this; if it could not run:
 
 ```bash
 # find it
-aws elasticloadbalancing describe-load-balancers \
+aws elbv2 describe-load-balancers \
   --query "LoadBalancers[?starts_with(LoadBalancerName,'<stack-name>')].[LoadBalancerName,LoadBalancerArn]" \
   --output table
 
 # delete it, then retry the stack delete
-aws elasticloadbalancing delete-load-balancer --load-balancer-arn <arn>
+aws elbv2 delete-load-balancer --load-balancer-arn <arn>
 aws cloudformation delete-stack --stack-name <stack-name>
 ```
 
@@ -253,9 +253,9 @@ aws cloudformation describe-stacks --stack-name <stack-name> \
 curl -s https://checkip.amazonaws.com
 
 # are the targets healthy?
-TG=$(aws elasticloadbalancing describe-target-groups \
+TG=$(aws elbv2 describe-target-groups \
   --query "TargetGroups[?starts_with(TargetGroupName,'k8s-voltmart')].TargetGroupArn" --output text | head -1)
-aws elasticloadbalancing describe-target-health --target-group-arn "$TG"
+aws elbv2 describe-target-health --target-group-arn "$TG"
 ```
 
 `AllowedIngressCidr` not matching your address is the most common cause by a wide margin.

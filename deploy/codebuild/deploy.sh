@@ -282,24 +282,76 @@ kubectl apply -k "$OVERLAY_DIR"
 # ===========================================================================
 log "Waiting for workloads to become ready"
 
-# The collector first: services export telemetry from the moment they start,
-# and a collector that is not up yet means the first traces are dropped.
-kubectl -n voltmart rollout status deployment/voltmart-collector --timeout=5m
+# Dumps everything needed to diagnose a stuck deployment into the build log.
+#
+# This exists because of a real incident: a deploy failed on a rollout
+# timeout, the stack rolled back, and the rollback deleted the log group
+# before anyone could read why. CloudFormation said only "WaitCondition timed
+# out". Printing the diagnosis at the moment of failure means the evidence is
+# already in the log, whatever happens to the stack afterwards.
+diagnose() {
+  local name="$1"
+  fail "deployment/${name} did not become ready — diagnostics follow"
 
+  echo "---------- pods ----------"
+  kubectl -n voltmart get pods -l "app.kubernetes.io/name=${name#voltmart-}" -o wide || true
+
+  echo "---------- describe (events are at the bottom) ----------"
+  kubectl -n voltmart describe deployment "$name" | tail -30 || true
+  for pod in $(kubectl -n voltmart get pods -l "app.kubernetes.io/name=${name#voltmart-}" \
+                 -o jsonpath='{.items[*].metadata.name}' 2>/dev/null); do
+    echo "---------- describe pod ${pod} ----------"
+    kubectl -n voltmart describe pod "$pod" | tail -40 || true
+    echo "---------- logs ${pod} (current) ----------"
+    kubectl -n voltmart logs "$pod" --tail=60 --all-containers 2>&1 | tail -60 || true
+    echo "---------- logs ${pod} (previous crash, if any) ----------"
+    kubectl -n voltmart logs "$pod" --previous --tail=60 --all-containers 2>&1 | tail -60 || true
+  done
+
+  echo "---------- namespace events ----------"
+  kubectl -n voltmart get events --sort-by=.lastTimestamp | tail -25 || true
+  echo "----------------------------------------"
+}
+
+# The collector goes first, because services export telemetry from the moment
+# they start and anything emitted before it is up is dropped.
+#
+# But it is NOT allowed to fail the deployment. Observability must never be a
+# hard dependency of the thing it observes: a storefront that works fine
+# except for missing traces is a far better outcome than no storefront at all.
+# Diagnostics are printed either way, so a broken collector is loud without
+# being fatal.
+if ! kubectl -n voltmart rollout status deployment/voltmart-collector --timeout=4m; then
+  warn "the ADOT collector did not become ready"
+  warn "the application will run; traces and metrics will not be exported"
+  diagnose voltmart-collector
+  COLLECTOR_HEALTHY=false
+else
+  COLLECTOR_HEALTHY=true
+fi
+
+# These are the application. A failure here is a failed deployment, because
+# without them there is nothing to show anyone.
 for deployment in catalog inventory cart orders payment checkout frontend; do
-  kubectl -n voltmart rollout status "deployment/voltmart-${deployment}" --timeout=5m
+  if ! kubectl -n voltmart rollout status "deployment/voltmart-${deployment}" --timeout=5m; then
+    diagnose "voltmart-${deployment}"
+    exit 1
+  fi
 done
 
-# The agent is last and allowed to fail without failing the deployment. Its
-# readiness probe checks that a Bedrock client can be built, so in an account
-# where model access has not been enabled it will never become ready — and
-# that should not block a workshop whose storefront works perfectly well.
+# The agent is allowed to fail. Its readiness probe checks that a Bedrock
+# client can be constructed, so in an account where model access has not been
+# enabled it never becomes ready — and that must not block a workshop whose
+# storefront works perfectly well.
 if ! kubectl -n voltmart rollout status deployment/voltmart-support-agent --timeout=6m; then
   warn "the support agent did not become ready"
   warn "this is almost always Bedrock model access for ${BEDROCK_MODEL_ID} not being enabled"
   warn "the storefront works regardless; enable model access and run:"
   warn "  kubectl -n voltmart rollout restart deployment/voltmart-support-agent"
-  kubectl -n voltmart logs deployment/voltmart-support-agent --tail=40 || true
+  diagnose voltmart-support-agent
+  AGENT_HEALTHY=false
+else
+  AGENT_HEALTHY=true
 fi
 
 # ===========================================================================
@@ -356,6 +408,8 @@ fi
 log "Deployment complete"
 info "storefront:  ${STOREFRONT_URL}"
 info "image tag:   ${IMAGE_TAG}"
+info "collector:   $([[ "${COLLECTOR_HEALTHY:-false}" == true ]] && echo 'ready' || echo 'NOT READY - telemetry is not being exported')"
+info "agent:       $([[ "${AGENT_HEALTHY:-false}" == true ]] && echo 'ready' || echo 'NOT READY - check Bedrock model access')"
 kubectl -n voltmart get pods -o wide
 
 # The trap signals SUCCESS with STOREFRONT_URL, which becomes the stack's

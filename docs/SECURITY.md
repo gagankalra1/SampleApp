@@ -326,7 +326,7 @@ Then confirm nothing is left:
 
 ```bash
 aws eks list-clusters
-aws elasticloadbalancing describe-load-balancers --query 'LoadBalancers[].LoadBalancerName'
+aws elbv2 describe-load-balancers --query 'LoadBalancers[].LoadBalancerName'
 aws ec2 describe-nat-gateways --filter Name=state,Values=available
 ```
 
